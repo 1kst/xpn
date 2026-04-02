@@ -5,6 +5,8 @@ INSTALL_DIR="/opt/xpn"
 SERVICE_NAME="xpn-node"
 REPO="1kst/xpn"
 VERSION_FILE="${INSTALL_DIR}/VERSION"
+LATEST_TAG_CACHE=""
+LATEST_TAG_CACHE_AT=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -20,9 +22,20 @@ check_root() {
 }
 
 resolve_latest_tag() {
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    local now fetched
+    now="$(date +%s)"
+    if [ -n "${LATEST_TAG_CACHE}" ] && (( now - LATEST_TAG_CACHE_AT < 300 )); then
+        echo "${LATEST_TAG_CACHE}"
+        return 0
+    fi
+    fetched="$(curl -fsSL --connect-timeout 3 --max-time 6 "https://api.github.com/repos/${REPO}/releases/latest" \
         | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-        | head -n1
+        | head -n1 || true)"
+    if [ -n "${fetched}" ]; then
+        LATEST_TAG_CACHE="${fetched}"
+        LATEST_TAG_CACHE_AT="${now}"
+    fi
+    echo "${fetched}"
 }
 
 normalize_version() {
