@@ -21,6 +21,7 @@ import (
 
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/mem"
 	psnet "github.com/shirou/gopsutil/v4/net"
 )
@@ -57,6 +58,7 @@ type NodeInfo struct {
 	NetOutSpeed       uint64         `json:"net_out_speed"`
 	NetInTransfer     uint64         `json:"net_in_transfer"`
 	NetOutTransfer    uint64         `json:"net_out_transfer"`
+	UptimeSeconds     uint64         `json:"uptime_seconds"`
 	ForceUpdate       bool           `json:"-"`
 	ForceBinUpdate    bool           `json:"-"`
 }
@@ -71,6 +73,7 @@ type SystemMetrics struct {
 	NetOutSpeed    uint64  `json:"net_out_speed"`
 	NetInTransfer  uint64  `json:"net_in_transfer"`
 	NetOutTransfer uint64  `json:"net_out_transfer"`
+	UptimeSeconds  uint64  `json:"uptime_seconds"`
 }
 
 type HeartbeatRequest struct {
@@ -307,6 +310,7 @@ func handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 			node.NetOutSpeed = req.System.NetOutSpeed
 			node.NetInTransfer = req.System.NetInTransfer
 			node.NetOutTransfer = req.System.NetOutTransfer
+			node.UptimeSeconds = req.System.UptimeSeconds
 		}
 		managedNodes[nodeID] = node
 		saveNodeToDB(node)
@@ -330,6 +334,7 @@ func handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 			node.NetOutSpeed = req.System.NetOutSpeed
 			node.NetInTransfer = req.System.NetInTransfer
 			node.NetOutTransfer = req.System.NetOutTransfer
+			node.UptimeSeconds = req.System.UptimeSeconds
 		}
 		if req.UpdateStatus != "" {
 			node.LastUpdateStatus = req.UpdateStatus
@@ -464,6 +469,7 @@ func handlePanelNodes(w http.ResponseWriter, r *http.Request) {
 			NetOutSpeed:       node.NetOutSpeed,
 			NetInTransfer:     node.NetInTransfer,
 			NetOutTransfer:    node.NetOutTransfer,
+			UptimeSeconds:     node.UptimeSeconds,
 		})
 	}
 
@@ -733,6 +739,9 @@ func collectSystemMetrics() *SystemMetrics {
 		lastNetOut = m.NetOutTransfer
 		lastNetAt = now
 		metricsMu.Unlock()
+	}
+	if up, err := host.Uptime(); err == nil {
+		m.UptimeSeconds = up
 	}
 
 	return m
