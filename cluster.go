@@ -18,6 +18,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/mem"
+	psnet "github.com/shirou/gopsutil/v4/net"
 )
 
 const (
@@ -43,8 +48,29 @@ type NodeInfo struct {
 	LastUpdateMessage string         `json:"last_update_message"`
 	LastUpdateAt      time.Time      `json:"last_update_at"`
 	CustomSNIListen   string         `json:"custom_sni_listen"`
+	CPU               float64        `json:"cpu"`
+	MemUsed           uint64         `json:"mem_used"`
+	MemTotal          uint64         `json:"mem_total"`
+	DiskUsed          uint64         `json:"disk_used"`
+	DiskTotal         uint64         `json:"disk_total"`
+	NetInSpeed        uint64         `json:"net_in_speed"`
+	NetOutSpeed       uint64         `json:"net_out_speed"`
+	NetInTransfer     uint64         `json:"net_in_transfer"`
+	NetOutTransfer    uint64         `json:"net_out_transfer"`
 	ForceUpdate       bool           `json:"-"`
 	ForceBinUpdate    bool           `json:"-"`
+}
+
+type SystemMetrics struct {
+	CPU            float64 `json:"cpu"`
+	MemUsed        uint64  `json:"mem_used"`
+	MemTotal       uint64  `json:"mem_total"`
+	DiskUsed       uint64  `json:"disk_used"`
+	DiskTotal      uint64  `json:"disk_total"`
+	NetInSpeed     uint64  `json:"net_in_speed"`
+	NetOutSpeed    uint64  `json:"net_out_speed"`
+	NetInTransfer  uint64  `json:"net_in_transfer"`
+	NetOutTransfer uint64  `json:"net_out_transfer"`
 }
 
 type HeartbeatRequest struct {
@@ -54,6 +80,7 @@ type HeartbeatRequest struct {
 	ConfigVersion int            `json:"config_version"`
 	NodeVersion   string         `json:"node_version"`
 	StatusData    map[string]int `json:"status_data"`
+	System        *SystemMetrics `json:"system,omitempty"`
 	UpdateStatus  string         `json:"update_status,omitempty"`
 	UpdateMessage string         `json:"update_message,omitempty"`
 	UpdateAt      string         `json:"update_at,omitempty"`
@@ -68,6 +95,10 @@ type probeState struct {
 var (
 	probeCache   = make(map[string]*probeState)
 	probeCacheMu sync.Mutex
+	metricsMu    sync.Mutex
+	lastNetIn    uint64
+	lastNetOut   uint64
+	lastNetAt    time.Time
 	nodeUpdateMu sync.Mutex
 	nodeUpdate   = struct {
 		Status  string
@@ -266,6 +297,17 @@ func handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 			StatusData:       req.StatusData,
 			CreatedAt:        time.Now(),
 		}
+		if req.System != nil {
+			node.CPU = req.System.CPU
+			node.MemUsed = req.System.MemUsed
+			node.MemTotal = req.System.MemTotal
+			node.DiskUsed = req.System.DiskUsed
+			node.DiskTotal = req.System.DiskTotal
+			node.NetInSpeed = req.System.NetInSpeed
+			node.NetOutSpeed = req.System.NetOutSpeed
+			node.NetInTransfer = req.System.NetInTransfer
+			node.NetOutTransfer = req.System.NetOutTransfer
+		}
 		managedNodes[nodeID] = node
 		saveNodeToDB(node)
 		log.Infof("new node registered: %s (IP: %s)", nodeID, remoteIP)
@@ -278,6 +320,17 @@ func handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		node.ConfigVersion = req.ConfigVersion
 		node.NodeVersion = req.NodeVersion
 		node.StatusData = req.StatusData
+		if req.System != nil {
+			node.CPU = req.System.CPU
+			node.MemUsed = req.System.MemUsed
+			node.MemTotal = req.System.MemTotal
+			node.DiskUsed = req.System.DiskUsed
+			node.DiskTotal = req.System.DiskTotal
+			node.NetInSpeed = req.System.NetInSpeed
+			node.NetOutSpeed = req.System.NetOutSpeed
+			node.NetInTransfer = req.System.NetInTransfer
+			node.NetOutTransfer = req.System.NetOutTransfer
+		}
 		if req.UpdateStatus != "" {
 			node.LastUpdateStatus = req.UpdateStatus
 			node.LastUpdateMessage = req.UpdateMessage
@@ -402,6 +455,15 @@ func handlePanelNodes(w http.ResponseWriter, r *http.Request) {
 			LastUpdateMessage: node.LastUpdateMessage,
 			LastUpdateAt:      node.LastUpdateAt,
 			CustomSNIListen:   node.CustomSNIListen,
+			CPU:               node.CPU,
+			MemUsed:           node.MemUsed,
+			MemTotal:          node.MemTotal,
+			DiskUsed:          node.DiskUsed,
+			DiskTotal:         node.DiskTotal,
+			NetInSpeed:        node.NetInSpeed,
+			NetOutSpeed:       node.NetOutSpeed,
+			NetInTransfer:     node.NetInTransfer,
+			NetOutTransfer:    node.NetOutTransfer,
 		})
 	}
 
@@ -636,6 +698,46 @@ func runProbing() {
 	}
 }
 
+func collectSystemMetrics() *SystemMetrics {
+	m := &SystemMetrics{}
+
+	if cp, err := cpu.Percent(0, false); err == nil && len(cp) > 0 {
+		m.CPU = cp[0]
+	}
+	if vm, err := mem.VirtualMemory(); err == nil {
+		m.MemUsed = vm.Total - vm.Available
+		m.MemTotal = vm.Total
+	}
+	if du, err := disk.Usage("/"); err == nil {
+		m.DiskUsed = du.Used
+		m.DiskTotal = du.Total
+	}
+	if io, err := psnet.IOCounters(false); err == nil && len(io) > 0 {
+		m.NetInTransfer = io[0].BytesRecv
+		m.NetOutTransfer = io[0].BytesSent
+
+		now := time.Now()
+		metricsMu.Lock()
+		if !lastNetAt.IsZero() {
+			sec := now.Sub(lastNetAt).Seconds()
+			if sec > 0 {
+				if m.NetInTransfer >= lastNetIn {
+					m.NetInSpeed = uint64(float64(m.NetInTransfer-lastNetIn) / sec)
+				}
+				if m.NetOutTransfer >= lastNetOut {
+					m.NetOutSpeed = uint64(float64(m.NetOutTransfer-lastNetOut) / sec)
+				}
+			}
+		}
+		lastNetIn = m.NetInTransfer
+		lastNetOut = m.NetOutTransfer
+		lastNetAt = now
+		metricsMu.Unlock()
+	}
+
+	return m
+}
+
 func probeTarget(target string) {
 	probeCacheMu.Lock()
 	state, exists := probeCache[target]
@@ -703,6 +805,7 @@ func sendHeartbeat() {
 		ConfigVersion: currentVersion,
 		NodeVersion:   NodeVersion,
 		StatusData:    statusData,
+		System:        collectSystemMetrics(),
 	}
 	if status, message, at := getNodeUpdateState(); status != "" {
 		req.UpdateStatus = status
