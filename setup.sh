@@ -115,6 +115,11 @@ mv -f "${INSTALL_DIR}/xpn-node.new" "${INSTALL_DIR}/xpn-node"
 cp -f "${tmp_dir}/xpn.sh" "${INSTALL_DIR}/xpn.sh.new"
 chmod +x "${INSTALL_DIR}/xpn.sh.new"
 mv -f "${INSTALL_DIR}/xpn.sh.new" "${INSTALL_DIR}/xpn.sh"
+# Important: old installs may have /usr/local/bin/xpn as a symlink to /opt/xpn/xpn.sh.
+# If we redirect into a symlink path, shell writes to target and corrupts xpn.sh.
+if [ -L /usr/local/bin/xpn ]; then
+    rm -f /usr/local/bin/xpn
+fi
 cat > /usr/local/bin/xpn <<EOF
 #!/bin/bash
 exec ${INSTALL_DIR}/xpn.sh "\$@"
