@@ -1,0 +1,65 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      - name: Build and Package
+        run: |
+          chmod +x build_deb.sh
+          # Make sure line endings are Unix-style if the script was created on Windows
+          sed -i 's/\r$//' build_deb.sh
+          sed -i 's/\r$//' setup.sh
+          sed -i 's/\r$//' xpn.sh
+          bash build_deb.sh
+          sha256sum xpn-node-linux-amd64.tar.gz > xpn-node-linux-amd64.tar.gz.sha256
+          sha256sum setup.sh > setup.sh.sha256
+          sha256sum xpn.sh > xpn.sh.sha256
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpn-node-linux-amd64-${{ github.ref_name }}
+          path: |
+            xpn-node-linux-amd64.tar.gz
+            xpn-node-linux-amd64.tar.gz.sha256
+            setup.sh
+            setup.sh.sha256
+            xpn.sh
+            xpn.sh.sha256
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            xpn-node-linux-amd64.tar.gz
+            xpn-node-linux-amd64.tar.gz.sha256
+            setup.sh
+            setup.sh.sha256
+            xpn.sh
+            xpn.sh.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

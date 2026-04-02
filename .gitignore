@@ -1,0 +1,13 @@
+# Binaries
+sni-proxy
+sni-proxy-linux-amd64
+sni-proxy.exe
+
+# Archives
+*.tar.gz
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+.gocache/

@@ -1,0 +1,16 @@
+[Unit]
+Description=SNI Proxy Node
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# ?????? Panel URL ??Token
+# ????????? -panel ??-token ???
+ExecStart=/usr/local/bin/xpn-node -mode node -panel http://YOUR_PANEL_IP:8888 -token YOUR_PANEL_TOKEN
+Restart=always
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# 只写端口号，前面留空，代表监听本机所有可用的IPv4和IPv6地址
+listen: ":443"
+log_level: "info"
+default_backend: "127.0.0.1:8080"
+
+# Web控制面板配置
+web_panel: ":8888"           # Web面板监听地址
+web_auth: "your-password"    # Web面板访问密码（留空则不需要密码）
+
+rules:
+  - sni: "secret.core.service.yourdomain.com"
+    backend: "127.0.0.1:9999"
+  - sni: "www.your-main-domain.com"
+    backend: "127.0.0.1:8080"
