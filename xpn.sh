@@ -13,7 +13,10 @@ BLUE='\033[0;34m'
 PLAIN='\033[0m'
 
 check_root() {
-    [[ $EUID -ne 0 ]] && echo -e "${RED}Error: run as root${PLAIN}" && exit 1
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Error: run as root${PLAIN}"
+        exit 1
+    fi
 }
 
 resolve_latest_tag() {
