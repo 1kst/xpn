@@ -140,6 +140,12 @@ do_update() {
 }
 
 show_menu() {
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo -e "${YELLOW}xpn menu requires an interactive TTY.${PLAIN}"
+        echo "Run it directly in a terminal session: xpn"
+        return 0
+    fi
+
     while true; do
         if [ -t 1 ]; then
             clear || true
@@ -160,7 +166,10 @@ show_menu() {
         show_status
         show_versions
         echo -ne "\nEnter [0-6]: "
-        read -r num
+        if ! read -r num; then
+            echo
+            return 0
+        fi
 
         case "$num" in
             1) start_service ;;

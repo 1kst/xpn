@@ -115,7 +115,11 @@ mv -f "${INSTALL_DIR}/xpn-node.new" "${INSTALL_DIR}/xpn-node"
 cp -f "${tmp_dir}/xpn.sh" "${INSTALL_DIR}/xpn.sh.new"
 chmod +x "${INSTALL_DIR}/xpn.sh.new"
 mv -f "${INSTALL_DIR}/xpn.sh.new" "${INSTALL_DIR}/xpn.sh"
-ln -sf "${INSTALL_DIR}/xpn.sh" /usr/local/bin/xpn
+cat > /usr/local/bin/xpn <<EOF
+#!/bin/bash
+exec ${INSTALL_DIR}/xpn.sh "\$@"
+EOF
+chmod +x /usr/local/bin/xpn
 
 echo "${VERSION_TAG}" > "${VERSION_FILE}"
 

@@ -41,7 +41,7 @@ const (
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.5"
+	NodeVersion  = "v1.1.6"
 )
 
 func binaryURLForVersion(version string) string {
