@@ -137,35 +137,41 @@ do_update() {
 }
 
 show_menu() {
-    clear
-    echo -e "\n  ${BLUE}======================================${PLAIN}"
-    echo -e "  ${GREEN}             XPN Node Menu           ${PLAIN}"
-    echo -e "  ${BLUE}======================================${PLAIN}"
-    echo -e "  ${YELLOW} 1.${PLAIN} Start service"
-    echo -e "  ${YELLOW} 2.${PLAIN} Stop service"
-    echo -e "  ${YELLOW} 3.${PLAIN} Restart service"
-    echo -e "  ${YELLOW} 4.${PLAIN} Show logs"
-    echo -e "  ${BLUE}--------------------------------------${PLAIN}"
-    echo -e "  ${YELLOW} 5.${PLAIN} Update program"
-    echo -e "  ${YELLOW} 6.${PLAIN} Uninstall"
-    echo -e "  ${BLUE}--------------------------------------${PLAIN}"
-    echo -e "  ${YELLOW} 0.${PLAIN} Exit"
+    while true; do
+        if [ -t 1 ]; then
+            clear || true
+        fi
+        echo -e "\n  ${BLUE}======================================${PLAIN}"
+        echo -e "  ${GREEN}             XPN Node Menu           ${PLAIN}"
+        echo -e "  ${BLUE}======================================${PLAIN}"
+        echo -e "  ${YELLOW} 1.${PLAIN} Start service"
+        echo -e "  ${YELLOW} 2.${PLAIN} Stop service"
+        echo -e "  ${YELLOW} 3.${PLAIN} Restart service"
+        echo -e "  ${YELLOW} 4.${PLAIN} Show logs"
+        echo -e "  ${BLUE}--------------------------------------${PLAIN}"
+        echo -e "  ${YELLOW} 5.${PLAIN} Update program"
+        echo -e "  ${YELLOW} 6.${PLAIN} Uninstall"
+        echo -e "  ${BLUE}--------------------------------------${PLAIN}"
+        echo -e "  ${YELLOW} 0.${PLAIN} Exit"
 
-    show_status
-    show_versions
-    echo -ne "\nEnter [0-6]: "
-    read -r num
+        show_status
+        show_versions
+        echo -ne "\nEnter [0-6]: "
+        read -r num
 
-    case "$num" in
-        1) start_service ;;
-        2) stop_service ;;
-        3) restart_service ;;
-        4) show_logs ;;
-        5) do_update ;;
-        6) uninstall ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}invalid input${PLAIN}" ;;
-    esac
+        case "$num" in
+            1) start_service ;;
+            2) stop_service ;;
+            3) restart_service ;;
+            4) show_logs ;;
+            5) do_update ;;
+            6) uninstall ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}invalid input${PLAIN}" ;;
+        esac
+        echo
+        read -r -p "Press Enter to continue..." _
+    done
 }
 
 check_root
