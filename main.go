@@ -36,12 +36,12 @@ const (
 	dnsCacheTTL      = 60 * time.Second
 	dnsNegativeTTL   = 5 * time.Second
 	dnsLookupTimeout = 2 * time.Second
-	DefaultBinaryURL = "https://github.com/1kst/xpfw/releases/latest/download/sni-proxy-linux-amd64.tar.gz"
+	DefaultBinaryURL = "https://github.com/1kst/xpn/releases/latest/download/xpn-node-linux-amd64.tar.gz"
 )
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.9"
+	NodeVersion  = "v1.1.10"
 )
 
 func binaryURLForVersion(version string) string {
@@ -49,7 +49,7 @@ func binaryURLForVersion(version string) string {
 	if v == "" {
 		return DefaultBinaryURL
 	}
-	return fmt.Sprintf("https://github.com/1kst/xpfw/releases/download/%s/sni-proxy-linux-amd64.tar.gz", v)
+	return fmt.Sprintf("https://github.com/1kst/xpn/releases/download/%s/xpn-node-linux-amd64.tar.gz", v)
 }
 
 const (
