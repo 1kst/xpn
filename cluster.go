@@ -908,14 +908,19 @@ func pullConfigFromPanel() {
 }
 
 func applyConfigFromPanel(configResp ConfigResponse) {
-	configMu.Lock()
+	configMu.RLock()
 	oldSNIListen := globalConfig.SNIListen
-	globalConfig.SNIListen = configResp.Config.SNIListen
-	globalConfig.DefaultBackend = configResp.Config.DefaultBackend
-	globalConfig.LogLevel = configResp.Config.LogLevel
-	configMu.Unlock()
+	configMu.RUnlock()
 
-	applyRules(configResp.Rules)
+	if err := saveConfig(configResp.Config); err != nil {
+		log.Errorf("save pulled config failed: %v", err)
+		return
+	}
+
+	if err := applyRules(configResp.Rules, configResp.ConfigVersion); err != nil {
+		log.Errorf("apply pulled rules failed: %v", err)
+		return
+	}
 
 	configVersionMu.Lock()
 	configVersionCounter = configResp.ConfigVersion
@@ -931,7 +936,63 @@ func applyConfigFromPanel(configResp ConfigResponse) {
 	go runProbing()
 }
 
-func applyRules(rules []Rule) {
+func applyRules(rules []Rule, configVersion int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM rules"); err != nil {
+		return err
+	}
+
+	type portStart struct {
+		id       int
+		name     string
+		port     int
+		dest     []string
+		strategy string
+	}
+	var portStarts []portStart
+
+	for _, rule := range rules {
+		rule.SNI = normalizeSNI(rule.SNI)
+		destJSON, _ := json.Marshal(rule.Dest)
+		enabled := 0
+		if rule.Enabled {
+			enabled = 1
+		}
+
+		result, err := tx.Exec(`
+			INSERT INTO rules (name, type, sni, listen_port, dest, lb_strategy, enabled, version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion)
+
+		if err != nil {
+			return err
+		}
+
+		if rule.Type == RuleTypePort && rule.Enabled {
+			id, _ := result.LastInsertId()
+			portStarts = append(portStarts, portStart{
+				id:       int(id),
+				name:     rule.Name,
+				port:     rule.ListenPort,
+				dest:     rule.Dest,
+				strategy: rule.LBStrategy,
+			})
+		}
+	}
+
+	if _, err := tx.Exec("UPDATE panel_config SET value = ? WHERE key = 'config_version'", configVersion); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
 	portListenersMu.Lock()
 	for port, pf := range portListeners {
 		log.Infof("stopping port forwarder on :%d for config update", port)
@@ -943,35 +1004,15 @@ func applyRules(rules []Rule) {
 	portListeners = make(map[int]*portForwarder)
 	portListenersMu.Unlock()
 
-	db.Exec("DELETE FROM rules")
-
-	for _, rule := range rules {
-		rule.SNI = normalizeSNI(rule.SNI)
-		destJSON, _ := json.Marshal(rule.Dest)
-		enabled := 0
-		if rule.Enabled {
-			enabled = 1
-		}
-
-		result, err := db.Exec(`
-			INSERT INTO rules (name, type, sni, listen_port, dest, lb_strategy, enabled)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled)
-
-		if err != nil {
-			log.Errorf("insert rule failed: %v", err)
-			continue
-		}
-
-		if rule.Type == RuleTypePort && rule.Enabled {
-			id, _ := result.LastInsertId()
-			ctx := context.Background()
-			go startPortForwarder(ctx, int(id), rule.Name, rule.ListenPort, rule.Dest, rule.LBStrategy)
-		}
+	for _, ps := range portStarts {
+		ctx := context.Background()
+		go startPortForwarder(ctx, ps.id, ps.name, ps.port, ps.dest, ps.strategy)
 	}
+
 	if err := rebuildSniRouteCacheFromDB(); err != nil {
-		log.Errorf("rebuild sni route cache failed: %v", err)
+		return err
 	}
+	return nil
 }
 
 func loadNodesFromDB() {
@@ -1105,7 +1146,7 @@ func updateBinaryAndExit(url string) error {
 		if err != nil {
 			return err
 		}
-		if filepath.Base(hdr.Name) == "sni-proxy" {
+		if filepath.Base(hdr.Name) == "xpn-node" {
 			payload, err = io.ReadAll(tr)
 			if err != nil {
 				return err
@@ -1114,7 +1155,7 @@ func updateBinaryAndExit(url string) error {
 		}
 	}
 	if len(payload) == 0 {
-		return fmt.Errorf("binary sni-proxy not found in package")
+		return fmt.Errorf("binary xpn-node not found in package")
 	}
 
 	exePath, err := os.Executable()
@@ -1122,8 +1163,8 @@ func updateBinaryAndExit(url string) error {
 		return err
 	}
 	dir := filepath.Dir(exePath)
-	newPath := filepath.Join(dir, "sni-proxy.new")
-	backupPath := filepath.Join(dir, "sni-proxy.bak")
+	newPath := filepath.Join(dir, "xpn-node.new")
+	backupPath := filepath.Join(dir, "xpn-node.bak")
 
 	if err := os.WriteFile(newPath, payload, 0755); err != nil {
 		return err
