@@ -16,6 +16,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,47 @@ type HeartbeatRequest struct {
 	UpdateStatus  string         `json:"update_status,omitempty"`
 	UpdateMessage string         `json:"update_message,omitempty"`
 	UpdateAt      string         `json:"update_at,omitempty"`
+	Traffic       *NodeCounters  `json:"traffic,omitempty"`
+}
+
+// NodeCounters carries the node's own accounting of proxied traffic. The panel's
+// existing net_in_transfer/net_out_transfer come from the host NIC and therefore
+// include everything else running on the box; these numbers are what this
+// process actually relayed, and they can be attributed to a rule.
+//
+// Every total is monotonic since process start and is paired with BootID. The
+// panel derives deltas itself, so a dropped heartbeat only coarsens the
+// resolution instead of losing the bytes: reporting deltas would discard them
+// permanently whenever a POST failed, which for geographically spread nodes is
+// routine rather than exceptional. A change of BootID tells the panel the
+// counters restarted from zero.
+type NodeCounters struct {
+	BootID string `json:"boot_id"`
+	// SNIMisses counts handshakes that matched no rule and fell through to
+	// default_backend. A rising rate means either a missing rule or someone
+	// probing the listener.
+	SNIMisses uint64 `json:"sni_misses"`
+	// Rules omits entries whose counters are all zero, so an idle fleet does not
+	// pay for 52 rules of zeroes on every heartbeat.
+	Rules []RuleCounter `json:"rules,omitempty"`
+}
+
+// RuleCounter is one rule's share of the traffic on this node. Up and Down are
+// kept apart because bandwidth is usually billed on egress alone.
+type RuleCounter struct {
+	RuleID int `json:"rule_id"`
+	// BytesUp is client to backend, BytesDown is backend to client. Both count
+	// payload bytes as seen by the relay, so they run a few percent below what
+	// the NIC reports for the same traffic once TCP/IP overhead is included.
+	BytesUp   uint64 `json:"up"`
+	BytesDown uint64 `json:"down"`
+	// Conns counts accepted connections, which separates a few large transfers
+	// from many small requests: the two load a node very differently.
+	Conns uint64 `json:"conns"`
+	// DialFail counts failures to reach a backend. Destinations that have never
+	// once been reachable from this node are excluded, so a rule pointing at a
+	// loopback or node-local address does not drown the signal.
+	DialFail uint64 `json:"dial_fail"`
 }
 
 type probeState struct {
@@ -136,6 +178,42 @@ func parseDBTime(s string) time.Time {
 		return t
 	}
 	return time.Time{}
+}
+
+// collectTrafficCounters snapshots the accounting for a heartbeat. Rules with
+// nothing to report are omitted so an idle fleet does not carry 52 rules of
+// zeroes on every beat.
+func collectTrafficCounters() *NodeCounters {
+	out := &NodeCounters{BootID: bootID, SNIMisses: sniMissCount.Load()}
+
+	trafficMu.RLock()
+	ids := make([]int, 0, len(trafficByRule))
+	for id := range trafficByRule {
+		ids = append(ids, id)
+	}
+	trafficMu.RUnlock()
+	sort.Ints(ids)
+
+	for _, id := range ids {
+		trafficMu.RLock()
+		c := trafficByRule[id]
+		trafficMu.RUnlock()
+		if c == nil {
+			continue
+		}
+		rc := RuleCounter{
+			RuleID:    id,
+			BytesUp:   c.bytesUp.Load(),
+			BytesDown: c.bytesDown.Load(),
+			Conns:     c.conns.Load(),
+			DialFail:  c.dialFail.Load(),
+		}
+		if rc.BytesUp == 0 && rc.BytesDown == 0 && rc.Conns == 0 && rc.DialFail == 0 {
+			continue
+		}
+		out.Rules = append(out.Rules, rc)
+	}
+	return out
 }
 
 func setNodeUpdateState(status, message string) {
@@ -740,7 +818,14 @@ func startNode(panelURL, token, nodeID string, pullInterval int) {
 	panelConfig.PullInterval = pullInterval
 	panelConfigMu.Unlock()
 
-	log.Infof("node mode initialized, panel: %s, node_id: %s", panelURL, nodeID)
+	// A fresh id each start tells the panel the counters below restarted at zero.
+	if b, err := generateCommKey(); err == nil {
+		bootID = b
+	} else {
+		bootID = fmt.Sprintf("boot-%d", time.Now().UnixNano())
+	}
+
+	log.Infof("node mode initialized, panel: %s, node_id: %s, boot: %s", panelURL, nodeID, bootID)
 
 	if !panelChannelIsSecure() {
 		// Worth stating plainly at startup: over plain HTTP the shared token
@@ -930,6 +1015,7 @@ func sendHeartbeat() {
 		NodeVersion:   NodeVersion,
 		StatusData:    statusData,
 		System:        collectSystemMetrics(),
+		Traffic:       collectTrafficCounters(),
 	}
 	reportedStatus, message, at := getNodeUpdateState()
 	if reportedStatus != "" {

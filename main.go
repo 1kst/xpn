@@ -41,7 +41,7 @@ const (
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.12"
+	NodeVersion  = "v1.1.13"
 )
 
 func binaryURLForVersion(version string) string {
@@ -87,9 +87,99 @@ type Config struct {
 }
 
 type sniRouteEntry struct {
+	// ruleID attributes the traffic this route carries. Port rules already know
+	// their id from startPortForwarder; SNI rules had no way to report it.
+	ruleID   int
 	dests    []string
 	strategy string
 	counter  uint64
+}
+
+// ruleCounters is one rule's accounting. Updated from the relay loops, so every
+// field is atomic and nothing here may take a lock.
+type ruleCounters struct {
+	bytesUp   atomic.Uint64
+	bytesDown atomic.Uint64
+	conns     atomic.Uint64
+	dialFail  atomic.Uint64
+}
+
+var (
+	trafficMu     sync.RWMutex
+	trafficByRule = make(map[int]*ruleCounters)
+	sniMissCount  atomic.Uint64
+	// bootID lets the panel tell a counter reset apart from a decrease it should
+	// never otherwise see.
+	bootID string
+	// reachableDest records, per destination, whether this node has ever managed
+	// to connect. A rule pointing at 127.0.0.1 or another node-local address is
+	// unreachable here by design, and counting those attempts as failures would
+	// make the dial failure rate useless.
+	reachableMu  sync.RWMutex
+	reachedDest  = make(map[string]bool)
+	attemptedDst = make(map[string]bool)
+)
+
+// counterFor returns the accounting slot for a rule, creating it on first use.
+func counterFor(ruleID int) *ruleCounters {
+	if ruleID <= 0 {
+		return nil
+	}
+	trafficMu.RLock()
+	c := trafficByRule[ruleID]
+	trafficMu.RUnlock()
+	if c != nil {
+		return c
+	}
+	trafficMu.Lock()
+	defer trafficMu.Unlock()
+	if c = trafficByRule[ruleID]; c == nil {
+		c = &ruleCounters{}
+		trafficByRule[ruleID] = c
+	}
+	return c
+}
+
+// isLoopback reports whether a destination is a loopback address, which is
+// never probed and never counted: whether it answers depends entirely on which
+// host the rule happens to be applied to.
+func isLoopback(dest string) bool {
+	host := strings.TrimSpace(dest)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	// "localhost" has exactly the same problem as 127.0.0.1: it resolves to
+	// whichever host the rule happens to run on.
+	return strings.EqualFold(host, "localhost")
+}
+
+// noteDialResult records reachability so a destination this node has never
+// reached is reported as not applicable rather than as a failure.
+func noteDialResult(dest string, ok bool) {
+	if isLoopback(dest) {
+		return
+	}
+	reachableMu.Lock()
+	attemptedDst[dest] = true
+	if ok {
+		reachedDest[dest] = true
+	}
+	reachableMu.Unlock()
+}
+
+// destEverReachable reports whether counting a failure against dest is
+// meaningful on this node.
+func destEverReachable(dest string) bool {
+	if isLoopback(dest) {
+		return false
+	}
+	reachableMu.RLock()
+	defer reachableMu.RUnlock()
+	return reachedDest[dest]
 }
 
 type portForwarder struct {
@@ -768,7 +858,11 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		log.WithFields(logrus.Fields{"client": clientAddr, "err": err}).Warn("SNI peek failed")
 	}
 
-	backend := routeSNIBackend(sni)
+	backend, ruleID := routeSNIBackend(sni)
+	counters := counterFor(ruleID)
+	if counters != nil {
+		counters.conns.Add(1)
+	}
 	fields := logrus.Fields{
 		"client":  clientAddr,
 		"sni":     sni,
@@ -782,9 +876,17 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 
 	backendConn, err := dialBackendWithDNSCache("tcp", backend, 6*time.Second)
 	if err != nil {
+		// Only counted once this node has proved it can reach the destination at
+		// all, so a rule aimed at a loopback or node-local address does not make
+		// the failure rate meaningless.
+		if counters != nil && destEverReachable(backend) {
+			counters.dialFail.Add(1)
+		}
+		noteDialResult(backend, false)
 		log.WithFields(logrus.Fields{"client": clientAddr, "backend": backend, "err": err}).Error("dial backend failed")
 		return
 	}
+	noteDialResult(backend, true)
 	defer backendConn.Close()
 
 	// The absolute cap now lives in sessionActivity. Setting it on the conns
@@ -804,8 +906,14 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 
 	activity := newSessionActivity(transferTimeout)
 	done := make(chan struct{}, 2)
-	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b")
-	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c")
+	// c->b is what the client uploads, b->c what it downloads. Kept apart because
+	// egress is usually the side that gets billed.
+	var up, down *atomic.Uint64
+	if counters != nil {
+		up, down = &counters.bytesUp, &counters.bytesDown
+	}
+	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b", up)
+	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c", down)
 
 	select {
 	case <-done:
@@ -818,15 +926,20 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	}
 }
 
-func routeSNIBackend(sni string) string {
+// routeSNIBackend also reports which rule matched, so the traffic can be
+// attributed. A zero rule id means nothing matched and the connection is about
+// to fall through to default_backend.
+func routeSNIBackend(sni string) (string, int) {
 	sniRouteMu.RLock()
 	entry := sniRouteCache[normalizeSNI(sni)]
 	sniRouteMu.RUnlock()
 	if entry != nil && len(entry.dests) > 0 {
-		return selectBackend(entry.dests, entry.strategy, &entry.counter)
+		return selectBackend(entry.dests, entry.strategy, &entry.counter), entry.ruleID
 	}
-	return getDefaultBackend()
+	sniMissCount.Add(1)
+	return getDefaultBackend(), 0
 }
+
 
 func normalizeSNI(s string) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(s, ".")))
@@ -838,7 +951,7 @@ func normalizeHost(s string) string {
 
 func rebuildSniRouteCacheFromDB() error {
 	rows, err := db.Query(`
-		SELECT COALESCE(sni, ''), dest, lb_strategy
+		SELECT id, COALESCE(sni, ''), dest, lb_strategy
 		FROM rules
 		WHERE type = ? AND enabled = 1
 	`, RuleTypeSNI)
@@ -849,8 +962,9 @@ func rebuildSniRouteCacheFromDB() error {
 
 	next := make(map[string]*sniRouteEntry)
 	for rows.Next() {
+		var ruleID int
 		var sni, destJSON, lbStrategy string
-		if err := rows.Scan(&sni, &destJSON, &lbStrategy); err != nil {
+		if err := rows.Scan(&ruleID, &sni, &destJSON, &lbStrategy); err != nil {
 			return err
 		}
 		var dests []string
@@ -862,6 +976,7 @@ func rebuildSniRouteCacheFromDB() error {
 			continue
 		}
 		next[normSNI] = &sniRouteEntry{
+			ruleID:   ruleID,
 			dests:    dests,
 			strategy: lbStrategy,
 		}
@@ -1093,7 +1208,7 @@ func startPortForwarder(ctx context.Context, ruleID int, name string, port int, 
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handlePortForward(c, dests, lbStrategy, &counter, portCtx)
+				handlePortForward(c, ruleID, dests, lbStrategy, &counter, portCtx)
 			}(conn)
 		}
 	}()
@@ -1115,17 +1230,27 @@ func stopAllPortForwarders() {
 	portListeners = make(map[int]*portForwarder)
 }
 
-func handlePortForward(client net.Conn, dests []string, lbStrategy string, counter *uint64, ctx context.Context) {
+func handlePortForward(client net.Conn, ruleID int, dests []string, lbStrategy string, counter *uint64, ctx context.Context) {
 	defer client.Close()
 	clientAddr := client.RemoteAddr().String()
+
+	counters := counterFor(ruleID)
+	if counters != nil {
+		counters.conns.Add(1)
+	}
 
 	backend := selectBackend(dests, lbStrategy, counter)
 
 	backendConn, err := dialBackendWithDNSCache("tcp", backend, 6*time.Second)
 	if err != nil {
+		if counters != nil && destEverReachable(backend) {
+			counters.dialFail.Add(1)
+		}
+		noteDialResult(backend, false)
 		log.WithFields(logrus.Fields{"client": clientAddr, "backend": backend, "err": err}).Error("dial backend failed")
 		return
 	}
+	noteDialResult(backend, true)
 	defer backendConn.Close()
 
 	_ = client.SetDeadline(time.Time{})
@@ -1138,8 +1263,12 @@ func handlePortForward(client net.Conn, dests []string, lbStrategy string, count
 
 	activity := newSessionActivity(transferTimeout)
 	done := make(chan struct{}, 2)
-	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b")
-	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c")
+	var up, down *atomic.Uint64
+	if counters != nil {
+		up, down = &counters.bytesUp, &counters.bytesDown
+	}
+	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b", up)
+	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c", down)
 
 	select {
 	case <-done:
@@ -1251,7 +1380,16 @@ func (s *sessionActivity) idleFor() time.Duration {
 // That absolute deadline is what makes transferTimeout real: previously every
 // read reset the connection deadline set by the caller, so the intended 2 hour
 // cap could never fire.
-func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.Duration, activity *sessionActivity, direction string) {
+// bytesTo accumulates relayed payload into a counter when one is supplied. A nil
+// counter means the connection could not be attributed to a rule (an SNI miss
+// routed to default_backend), and the bytes are simply not attributed.
+func bytesTo(c *atomic.Uint64, n int) {
+	if c != nil && n > 0 {
+		c.Add(uint64(n))
+	}
+}
+
+func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.Duration, activity *sessionActivity, direction string, relayed *atomic.Uint64) {
 	defer func() {
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -1287,8 +1425,12 @@ func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.
 			activity.touch()
 			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
+				// Counted on the read: the bytes did cross this node even if the
+				// far side went away before they could be handed on.
+				bytesTo(relayed, n)
 				return
 			}
+			bytesTo(relayed, n)
 			activity.touch()
 		}
 
