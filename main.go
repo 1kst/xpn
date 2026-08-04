@@ -940,7 +940,6 @@ func routeSNIBackend(sni string) (string, int) {
 	return getDefaultBackend(), 0
 }
 
-
 func normalizeSNI(s string) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(s, ".")))
 }
