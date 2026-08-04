@@ -108,7 +108,28 @@ type NodeCounters struct {
 	// SNIMisses counts handshakes that matched no rule and fell through to
 	// default_backend. A rising rate means either a missing rule or someone
 	// probing the listener.
+	//
+	// It is the sum of the three fields below and stays on the wire in its own
+	// right: a panel older than the split reads it and is none the wiser.
 	SNIMisses uint64 `json:"sni_misses"`
+	// The three kinds of miss, because the total cannot be acted on. A node too
+	// old to report the split sends none of them, which reads as zero rather
+	// than as a claim, so the panel has to treat "all three zero while SNIMisses
+	// is not" as unknown rather than as no misses.
+	//
+	// MissNoTLS is a connection whose ClientHello could not be read at all: a
+	// bare TCP connect that sent nothing, a port probe, a plain HTTP request. A
+	// browser's speculative preconnect lands here too, so this is background
+	// noise more often than it is hostile.
+	MissNoTLS uint64 `json:"miss_no_tls,omitempty"`
+	// MissNoSNI is a valid ClientHello with no server name in it, which means a
+	// client that dialled this node by address instead of by hostname.
+	MissNoSNI uint64 `json:"miss_no_sni,omitempty"`
+	// MissNoRule is a client that asked for a specific hostname this node does
+	// not serve. This is the actionable one: it means a rule is missing, or was
+	// deleted while clients were still using it, or someone has pointed a domain
+	// at this node.
+	MissNoRule uint64 `json:"miss_no_rule,omitempty"`
 	// Rules omits entries whose counters are all zero, so an idle fleet does not
 	// pay for 52 rules of zeroes on every heartbeat.
 	Rules []RuleCounter `json:"rules,omitempty"`
@@ -184,7 +205,13 @@ func parseDBTime(s string) time.Time {
 // nothing to report are omitted so an idle fleet does not carry 52 rules of
 // zeroes on every beat.
 func collectTrafficCounters() *NodeCounters {
-	out := &NodeCounters{BootID: bootID, SNIMisses: sniMissCount.Load()}
+	out := &NodeCounters{
+		BootID:     bootID,
+		SNIMisses:  totalSNIMisses(),
+		MissNoTLS:  missNoTLS.Load(),
+		MissNoSNI:  missNoSNI.Load(),
+		MissNoRule: missNoRule.Load(),
+	}
 
 	trafficMu.RLock()
 	ids := make([]int, 0, len(trafficByRule))
@@ -1125,6 +1152,7 @@ func pullConfigFromPanel() {
 func applyConfigFromPanel(configResp ConfigResponse) {
 	configMu.RLock()
 	oldSNIListen := globalConfig.SNIListen
+	oldLogLevel := globalConfig.LogLevel
 	localWebPanel := globalConfig.WebPanel
 	localWebAuth := globalConfig.WebAuth
 	localWebTitle := globalConfig.WebTitle
@@ -1145,6 +1173,16 @@ func applyConfigFromPanel(configResp ConfigResponse) {
 	if err := saveConfig(incoming); err != nil {
 		log.Errorf("save pulled config failed: %v", err)
 		return
+	}
+
+	// setLogLevel as well as saveConfig: the level was reaching the database and
+	// stopping there, so changing it from the panel appeared to do nothing until
+	// the process happened to restart. It is the one setting an operator changes
+	// specifically to watch what is happening right now, which makes a silent
+	// delay of unbounded length the worst possible behaviour for it.
+	if strings.TrimSpace(incoming.LogLevel) != "" && incoming.LogLevel != oldLogLevel {
+		log.Infof("[Sync] log level changed: %q -> %q", oldLogLevel, incoming.LogLevel)
+		setLogLevel(incoming.LogLevel)
 	}
 
 	if err := applyRules(configResp.Rules, configResp.ConfigVersion); err != nil {

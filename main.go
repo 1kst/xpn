@@ -41,7 +41,7 @@ const (
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.14"
+	NodeVersion  = "v1.1.15"
 )
 
 func binaryURLForVersion(version string) string {
@@ -107,7 +107,25 @@ type ruleCounters struct {
 var (
 	trafficMu     sync.RWMutex
 	trafficByRule = make(map[int]*ruleCounters)
-	sniMissCount  atomic.Uint64
+	// The three ways a connection can fail to reach a rule, counted apart because
+	// the single total they used to share cannot be acted on. They mean different
+	// things and call for different responses:
+	//
+	//	missNoTLS  the bytes were not a usable ClientHello at all -- a bare TCP
+	//	           connect that sent nothing, a port probe, a plain HTTP request.
+	//	           Browsers also land here through speculative preconnect, so this
+	//	           is not by itself evidence of hostility.
+	//	missNoSNI  a valid ClientHello carrying no server name. A client that
+	//	           dialled by IP address rather than by hostname.
+	//	missNoRule a client asked for a specific hostname this node does not
+	//	           serve. The only one of the three that points at a missing or
+	//	           deleted rule, and therefore the only one worth an alert.
+	//
+	// Their sum is reported as SNIMisses so a panel that predates the split still
+	// sees the same total it always did.
+	missNoTLS  atomic.Uint64
+	missNoSNI  atomic.Uint64
+	missNoRule atomic.Uint64
 	// bootID lets the panel tell a counter reset apart from a decrease it should
 	// never otherwise see.
 	bootID string
@@ -858,7 +876,10 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		log.WithFields(logrus.Fields{"client": clientAddr, "err": err}).Warn("SNI peek failed")
 	}
 
-	backend, ruleID := routeSNIBackend(sni)
+	backend, ruleID, matched := routeSNIBackend(sni)
+	if !matched {
+		noteSNIMiss(sni, err)
+	}
 	counters := counterFor(ruleID)
 	if counters != nil {
 		counters.conns.Add(1)
@@ -872,6 +893,14 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		log.WithFields(fields).Debug("SNI route")
 	} else if atomic.AddUint64(&sniRouteLogN, 1)%200 == 0 {
 		log.WithFields(fields).Info("SNI route sample")
+	}
+	// A miss that carried a hostname is logged in full, unsampled: it means a
+	// client asked for something this node does not serve, which is either a
+	// rule that was deleted by mistake or somebody pointing a domain here. The
+	// other two kinds are dominated by port probes and browser preconnects and
+	// would bury it, so they stay on the sample path above.
+	if !matched && err == nil && sni != "" {
+		log.WithFields(logrus.Fields{"client": clientAddr, "sni": sni}).Warn("no rule for requested hostname")
 	}
 
 	backendConn, err := dialBackendWithDNSCache("tcp", backend, 6*time.Second)
@@ -927,17 +956,37 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 }
 
 // routeSNIBackend also reports which rule matched, so the traffic can be
-// attributed. A zero rule id means nothing matched and the connection is about
-// to fall through to default_backend.
-func routeSNIBackend(sni string) (string, int) {
+// attributed, and whether anything matched at all. The match is returned
+// explicitly rather than inferred from a zero rule id: the caller classifies the
+// miss, and it should not have to know which sentinel means "none".
+func routeSNIBackend(sni string) (backend string, ruleID int, matched bool) {
 	sniRouteMu.RLock()
 	entry := sniRouteCache[normalizeSNI(sni)]
 	sniRouteMu.RUnlock()
 	if entry != nil && len(entry.dests) > 0 {
-		return selectBackend(entry.dests, entry.strategy, &entry.counter), entry.ruleID
+		return selectBackend(entry.dests, entry.strategy, &entry.counter), entry.ruleID, true
 	}
-	sniMissCount.Add(1)
-	return getDefaultBackend(), 0
+	return getDefaultBackend(), 0, false
+}
+
+// noteSNIMiss books a connection that reached no rule against the reason it did
+// not. Counting happens here rather than inside routeSNIBackend because only the
+// caller knows whether the ClientHello parsed, and that distinction is the whole
+// point of splitting the counter.
+func noteSNIMiss(sni string, peekErr error) {
+	switch {
+	case peekErr != nil:
+		missNoTLS.Add(1)
+	case sni == "":
+		missNoSNI.Add(1)
+	default:
+		missNoRule.Add(1)
+	}
+}
+
+// totalSNIMisses is what the wire protocol has always called SNIMisses.
+func totalSNIMisses() uint64 {
+	return missNoTLS.Load() + missNoSNI.Load() + missNoRule.Load()
 }
 
 func normalizeSNI(s string) string {
