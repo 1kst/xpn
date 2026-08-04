@@ -130,6 +130,19 @@ type NodeCounters struct {
 	// deleted while clients were still using it, or someone has pointed a domain
 	// at this node.
 	MissNoRule uint64 `json:"miss_no_rule,omitempty"`
+	// LogLines and LogSuppressed are how much this process has written to its log
+	// and how much it collapsed as repetition. Counted in the process rather than
+	// read from journald: reading the journal would mean running journalctl, and
+	// giving a root daemon that auto-updates from a public repository the ability
+	// to execute processes is a far larger change than this question is worth. It
+	// would also measure the whole shared journal rather than this node's share
+	// of it, which is the number an operator actually needs.
+	//
+	// A high LogSuppressed is not a problem in itself -- it is the mechanism
+	// working. The pair is what matters: suppressed climbing while emitted stays
+	// flat means something is failing repeatedly and quietly.
+	LogLines      uint64 `json:"log_lines,omitempty"`
+	LogSuppressed uint64 `json:"log_suppressed,omitempty"`
 	// Rules omits entries whose counters are all zero, so an idle fleet does not
 	// pay for 52 rules of zeroes on every heartbeat.
 	Rules []RuleCounter `json:"rules,omitempty"`
@@ -205,12 +218,15 @@ func parseDBTime(s string) time.Time {
 // nothing to report are omitted so an idle fleet does not carry 52 rules of
 // zeroes on every beat.
 func collectTrafficCounters() *NodeCounters {
+	emitted, suppressed := logCounters()
 	out := &NodeCounters{
-		BootID:     bootID,
-		SNIMisses:  totalSNIMisses(),
-		MissNoTLS:  missNoTLS.Load(),
-		MissNoSNI:  missNoSNI.Load(),
-		MissNoRule: missNoRule.Load(),
+		BootID:        bootID,
+		SNIMisses:     totalSNIMisses(),
+		MissNoTLS:     missNoTLS.Load(),
+		MissNoSNI:     missNoSNI.Load(),
+		MissNoRule:    missNoRule.Load(),
+		LogLines:      emitted,
+		LogSuppressed: suppressed,
 	}
 
 	trafficMu.RLock()

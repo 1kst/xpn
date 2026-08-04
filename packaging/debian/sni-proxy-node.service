@@ -5,12 +5,27 @@ After=network.target
 [Service]
 Type=simple
 User=root
-# ?????? Panel URL ??Token
-# ????????? -panel ??-token ???
+# Replace the panel address and token below before enabling this unit. Both are
+# required in node mode: the process refuses to start without them.
 ExecStart=/usr/local/bin/xpn-node -mode node -panel http://YOUR_PANEL_IP:8888 -token YOUR_PANEL_TOKEN
 Restart=always
 RestartSec=5s
+# A node terminates two sockets per proxied connection, so the default 1024 file
+# descriptor limit is reached long before any other resource.
 LimitNOFILE=1048576
+
+# Logging. The identifier makes lines attributable with `journalctl -t xpn-node`
+# rather than only by unit name.
+SyslogIdentifier=xpn-node
+# A per-unit rate limit, because journald's capacity is shared with every other
+# service on the box: without one, a node logging per connection can push nginx's
+# or the database's history out of the ring. The process collapses repeated
+# messages itself and settles at a few lines a minute, so this leaves roughly two
+# orders of magnitude of headroom for startup and config-reload bursts while still
+# capping a runaway. Silently ignored by systemd older than 240, which falls back
+# to the global limit.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
 
 [Install]
 WantedBy=multi-user.target

@@ -41,7 +41,7 @@ const (
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.15"
+	NodeVersion  = "v1.1.16"
 )
 
 func binaryURLForVersion(version string) string {
@@ -873,7 +873,14 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 
 	sni, peeked, err := peekClientHelloSNI(br)
 	if err != nil {
-		log.WithFields(logrus.Fields{"client": clientAddr, "err": err}).Warn("SNI peek failed")
+		// The highest-volume line on the node: every port probe and every browser
+		// preconnect that opens a connection without sending a ClientHello lands
+		// here. Keyed on the message alone -- the reason a handshake was unreadable
+		// is nearly always the same one, and the client address is a sample rather
+		// than something worth a key per value.
+		if n, ok := throttledLog("peek"); ok {
+			log.WithFields(throttledFields(logrus.Fields{"client": clientAddr, "err": err}, n)).Warn("SNI peek failed")
+		}
 	}
 
 	backend, ruleID, matched := routeSNIBackend(sni)
@@ -900,7 +907,12 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	// other two kinds are dominated by port probes and browser preconnects and
 	// would bury it, so they stay on the sample path above.
 	if !matched && err == nil && sni != "" {
-		log.WithFields(logrus.Fields{"client": clientAddr, "sni": sni}).Warn("no rule for requested hostname")
+		// Deliberately NOT keyed by the hostname: a scanner chooses it, so a key per
+		// value would let a client grow this map without bound. One key, with the
+		// hostname of the emitted occurrence as a sample and the count of the rest.
+		if n, ok := throttledLog("norule"); ok {
+			log.WithFields(throttledFields(logrus.Fields{"client": clientAddr, "sni": sni}, n)).Warn("no rule for requested hostname")
+		}
 	}
 
 	backendConn, err := dialBackendWithDNSCache("tcp", backend, 6*time.Second)
@@ -912,7 +924,12 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 			counters.dialFail.Add(1)
 		}
 		noteDialResult(backend, false)
-		log.WithFields(logrus.Fields{"client": clientAddr, "backend": backend, "err": err}).Error("dial backend failed")
+		// Keyed by backend so one broken destination does not hide another, and so a
+		// node whose default_backend refuses every unmatched connection reports it
+		// once a minute with a count instead of once per connection.
+		if n, ok := throttledLog("dial:" + backend); ok {
+			log.WithFields(throttledFields(logrus.Fields{"client": clientAddr, "backend": backend, "err": err}, n)).Error("dial backend failed")
+		}
 		return
 	}
 	noteDialResult(backend, true)
@@ -1295,7 +1312,9 @@ func handlePortForward(client net.Conn, ruleID int, dests []string, lbStrategy s
 			counters.dialFail.Add(1)
 		}
 		noteDialResult(backend, false)
-		log.WithFields(logrus.Fields{"client": clientAddr, "backend": backend, "err": err}).Error("dial backend failed")
+		if n, ok := throttledLog("dialport:" + backend); ok {
+			log.WithFields(throttledFields(logrus.Fields{"client": clientAddr, "backend": backend, "err": err}, n)).Error("dial backend failed")
+		}
 		return
 	}
 	noteDialResult(backend, true)

@@ -183,6 +183,14 @@ TimeoutStopSec=5
 # A node terminates two sockets per proxied connection, so the default 1024 file
 # descriptor limit is reached long before any other resource.
 LimitNOFILE=1048576
+# journald's capacity is shared with every other service on this box, so a node
+# that logs per connection can push their history out of the ring. The process
+# collapses repeated messages itself and settles at a few lines a minute; this
+# leaves ample headroom for startup bursts while capping a runaway. Ignored by
+# systemd older than 240.
+SyslogIdentifier=xpn-node
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
 
 [Install]
 WantedBy=multi-user.target
