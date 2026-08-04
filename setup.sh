@@ -10,10 +10,39 @@ systemd_escape_arg() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
 }
 
+# The `|| true` matters: under `set -euo pipefail` a failed curl (no network,
+# DNS failure, GitHub 403 rate limit) makes the whole pipeline non-zero and
+# aborts the script at the assignment, so the explicit "failed to resolve" check
+# below could never run and the user saw a silent exit.
 resolve_latest_tag() {
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    curl -fsSL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" \
         | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-        | head -n1
+        | head -n1 || true
+}
+
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Error: run as root"
+        exit 1
+    fi
+}
+
+# Maps the machine's architecture onto a release asset. Without this the script
+# always fetched the amd64 build: on arm64 the download and checksum both
+# succeeded and the failure only surfaced later as a systemd "Exec format error",
+# retried every 5 seconds by Restart=always.
+detect_arch() {
+    local machine
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64) ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        *)
+            echo "Error: unsupported architecture: ${machine}"
+            echo "Supported: x86_64/amd64, aarch64/arm64"
+            exit 1
+            ;;
+    esac
 }
 
 require_cmd() {
@@ -68,10 +97,17 @@ if [ -z "$ARG_PANEL" ] || [ -z "$ARG_TOKEN" ]; then
     exit 1
 fi
 
+# Checked before anything is downloaded or written, so an unprivileged run fails
+# immediately instead of part way through the install.
+check_root
+
 require_cmd curl
 require_cmd tar
 require_cmd sha256sum
 require_cmd systemctl
+require_cmd uname
+
+detect_arch
 
 if [ -n "$ARG_VERSION" ]; then
     VERSION_TAG="$ARG_VERSION"
@@ -85,7 +121,7 @@ if [ -z "$VERSION_TAG" ]; then
 fi
 
 BASE_RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION_TAG}"
-BINARY_URL="${BASE_RELEASE_URL}/xpn-node-linux-amd64.tar.gz"
+BINARY_URL="${BASE_RELEASE_URL}/xpn-node-linux-${ARCH}.tar.gz"
 BINARY_SHA_URL="${BINARY_URL}.sha256"
 SCRIPT_URL="${BASE_RELEASE_URL}/xpn.sh"
 SCRIPT_SHA_URL="${SCRIPT_URL}.sha256"
@@ -144,6 +180,9 @@ ExecStart=${INSTALL_DIR}/xpn-node -mode node -panel "${PANEL_ESC}" -token "${TOK
 Restart=always
 RestartSec=5
 TimeoutStopSec=5
+# A node terminates two sockets per proxied connection, so the default 1024 file
+# descriptor limit is reached long before any other resource.
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -153,4 +192,4 @@ systemctl daemon-reload
 systemctl enable ${SERVICE_NAME}
 systemctl restart ${SERVICE_NAME}
 
-echo "Install complete. Service=${SERVICE_NAME}, Version=${VERSION_TAG}"
+echo "Install complete. Service=${SERVICE_NAME}, Version=${VERSION_TAG}, Arch=${ARCH}"

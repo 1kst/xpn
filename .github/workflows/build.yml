@@ -20,8 +20,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      
+          # Taken from go.mod so the toolchain cannot drift out of sync with what
+          # the module actually requires (it asked for 1.24 while this pinned 1.21,
+          # leaving the real compiler version to an implicit toolchain download).
+          go-version-file: go.mod
+
       - name: Build and Package
         run: |
           chmod +x build_deb.sh
@@ -29,18 +32,22 @@ jobs:
           sed -i 's/\r$//' build_deb.sh
           sed -i 's/\r$//' setup.sh
           sed -i 's/\r$//' xpn.sh
-          bash build_deb.sh
+          bash build_deb.sh amd64
           sha256sum xpn-node-linux-amd64.tar.gz > xpn-node-linux-amd64.tar.gz.sha256
+          bash build_deb.sh arm64
+          sha256sum xpn-node-linux-arm64.tar.gz > xpn-node-linux-arm64.tar.gz.sha256
           sha256sum setup.sh > setup.sh.sha256
           sha256sum xpn.sh > xpn.sh.sha256
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xpn-node-linux-amd64-${{ github.ref_name }}
+          name: xpn-node-linux-${{ github.ref_name }}
           path: |
             xpn-node-linux-amd64.tar.gz
             xpn-node-linux-amd64.tar.gz.sha256
+            xpn-node-linux-arm64.tar.gz
+            xpn-node-linux-arm64.tar.gz.sha256
             setup.sh
             setup.sh.sha256
             xpn.sh
@@ -57,6 +64,8 @@ jobs:
           files: |
             xpn-node-linux-amd64.tar.gz
             xpn-node-linux-amd64.tar.gz.sha256
+            xpn-node-linux-arm64.tar.gz
+            xpn-node-linux-arm64.tar.gz.sha256
             setup.sh
             setup.sh.sha256
             xpn.sh

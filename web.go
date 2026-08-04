@@ -70,7 +70,7 @@ func startWebPanel(addr, _ string) {
 }
 
 func loadSessionsFromDB() {
-	rows, err := db.Query("SELECT token, created_at, expires_at FROM sessions WHERE expires_at > datetime('now')")
+	rows, err := db.Query("SELECT token, created_at, expires_at FROM sessions")
 	if err != nil {
 		log.Warnf("load sessions from db: %v", err)
 		return
@@ -85,8 +85,8 @@ func loadSessionsFromDB() {
 			continue
 		}
 
-		created, _ := time.Parse("2006-01-02 15:04:05", createdAt)
-		expires, _ := time.Parse("2006-01-02 15:04:05", expiresAt)
+		created := parseDBTime(createdAt)
+		expires := parseDBTime(expiresAt)
 
 		sessionCache[token] = &sessionInfo{
 			token:     token,
@@ -104,7 +104,7 @@ func cleanupRoutine() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		result, err := db.Exec("DELETE FROM sessions WHERE expires_at <= datetime('now')")
+		result, err := db.Exec("DELETE FROM sessions WHERE expires_at <= ?", formatDBTime(time.Now()))
 		if err == nil {
 			if affected, _ := result.RowsAffected(); affected > 0 {
 				log.Infof("cleaned %d expired sessions from database", affected)
@@ -213,7 +213,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	expiresAt := now.Add(sessionDuration)
 
 	_, err := db.Exec("INSERT INTO sessions (token, created_at, expires_at) VALUES (?, ?, ?)",
-		token, now.Format("2006-01-02 15:04:05"), expiresAt.Format("2006-01-02 15:04:05"))
+		token, formatDBTime(now), formatDBTime(expiresAt))
 
 	if err != nil {
 		log.Errorf("failed to save session to db: %v", err)
@@ -291,7 +291,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			newExpiresAt := time.Now().Add(sessionDuration)
 
 			db.Exec("UPDATE sessions SET expires_at = ? WHERE token = ?",
-				newExpiresAt.Format("2006-01-02 15:04:05"), token)
+				formatDBTime(newExpiresAt), token)
 
 			sessionCacheMu.Lock()
 			session.expiresAt = newExpiresAt
@@ -305,12 +305,12 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			var expiresAtStr string
 			err := db.QueryRow("SELECT expires_at FROM sessions WHERE token = ?", token).Scan(&expiresAtStr)
 			if err == nil {
-				expiresAt, _ := time.Parse("2006-01-02 15:04:05", expiresAtStr)
+				expiresAt := parseDBTime(expiresAtStr)
 				if time.Now().Before(expiresAt) {
 					newExpiresAt := time.Now().Add(sessionDuration)
 
 					db.Exec("UPDATE sessions SET expires_at = ? WHERE token = ?",
-						newExpiresAt.Format("2006-01-02 15:04:05"), token)
+						formatDBTime(newExpiresAt), token)
 
 					sessionCacheMu.Lock()
 					sessionCache[token] = &sessionInfo{
@@ -326,36 +326,83 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		if subtle.ConstantTimeCompare([]byte(token), []byte(password)) == 1 {
-			next(w, r)
-			return
-		}
-
+		// No password-as-token fallback. Accepting the raw password here bypassed
+		// the login rate limiter entirely, turning any authenticated endpoint
+		// into an unthrottled password oracle.
 		http.Error(w, `{"error":"Unauthorized"}`, http.StatusUnauthorized)
 	}
 }
 
+// invalidateAllSessions drops every session, in memory and on disk. Changing the
+// password has to do this, otherwise a stolen token stays valid indefinitely
+// because every use slides its own expiry forward.
+func invalidateAllSessions(reason string) {
+	sessionCacheMu.Lock()
+	sessionCache = make(map[string]*sessionInfo)
+	sessionCacheMu.Unlock()
+
+	if _, err := db.Exec("DELETE FROM sessions"); err != nil {
+		log.Errorf("clear sessions after %s failed: %v", reason, err)
+		return
+	}
+	log.Warnf("all web sessions invalidated (%s)", reason)
+}
+
+// redactedConfigMarker is echoed in place of the stored password. Posting it back
+// unchanged means "keep the existing value".
+const redactedConfigMarker = "********"
+
 func handleConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
+	switch r.Method {
+	case "GET":
 		configMu.RLock()
-		defer configMu.RUnlock()
+		cfg := globalConfig
+		configMu.RUnlock()
+
+		// Never echo the password. The front end polls this endpoint, so it used
+		// to travel in a response body on every page load.
+		if strings.TrimSpace(cfg.WebAuth) != "" {
+			cfg.WebAuth = redactedConfigMarker
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(globalConfig)
-	} else if r.Method == "POST" {
-		var cfg Config
+		json.NewEncoder(w).Encode(cfg)
+
+	case "POST":
+		configMu.RLock()
+		previous := globalConfig
+		configMu.RUnlock()
+
+		// Start from the current config so a field the client omits keeps its
+		// value instead of being reset to the zero value.
+		cfg := previous
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if cfg.WebAuth == redactedConfigMarker {
+			cfg.WebAuth = previous.WebAuth
+		}
+
 		if err := saveConfig(cfg); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		if cfg.WebAuth != previous.WebAuth {
+			invalidateAllSessions("panel password changed")
+		}
+		if cfg.LogLevel != previous.LogLevel {
+			setLogLevel(cfg.LogLevel)
 		}
 
 		incrementConfigVersion()
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -400,31 +447,100 @@ func handleRule(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// validateRule rejects the inputs that silently misbehave downstream. Chief
+// among them listen_port 0, which makes net.Listen pick an arbitrary free port
+// that no longer corresponds to anything the operator can see or clean up.
+func validateRule(rule *Rule) error {
+	rule.Name = strings.TrimSpace(rule.Name)
+	if rule.Name == "" {
+		return fmt.Errorf("规则名称不能为空")
+	}
+	if rule.Type == "" {
+		rule.Type = RuleTypeSNI
+	}
+	if rule.Type != RuleTypeSNI && rule.Type != RuleTypePort {
+		return fmt.Errorf("规则类型必须是 %s 或 %s", RuleTypeSNI, RuleTypePort)
+	}
+	if rule.LBStrategy == "" {
+		rule.LBStrategy = LBRoundRobin
+	}
+	switch rule.LBStrategy {
+	case LBRoundRobin, LBRandom, LBFirstOnly, LBHealthCheck:
+	default:
+		return fmt.Errorf("未知的负载策略: %s", rule.LBStrategy)
+	}
+
+	cleaned := make([]string, 0, len(rule.Dest))
+	for _, d := range rule.Dest {
+		if d = strings.TrimSpace(d); d != "" {
+			cleaned = append(cleaned, d)
+		}
+	}
+	rule.Dest = cleaned
+	if len(rule.Dest) == 0 {
+		return fmt.Errorf("目标地址不能为空")
+	}
+
+	if rule.Type == RuleTypeSNI {
+		rule.SNI = normalizeSNI(rule.SNI)
+		if rule.SNI == "" {
+			return fmt.Errorf("SNI 不能为空")
+		}
+		rule.ListenPort = 0
+		return nil
+	}
+
+	if rule.ListenPort < 1 || rule.ListenPort > 65535 {
+		return fmt.Errorf("监听端口必须在 1-65535 之间")
+	}
+	rule.SNI = ""
+	return nil
+}
+
+// stopPortForwarder tears down the listener bound to port, if any.
+func stopPortForwarder(port int) {
+	if port == 0 {
+		return
+	}
+	portListenersMu.Lock()
+	if pf, ok := portListeners[port]; ok {
+		pf.cancel()
+		if pf.ln != nil {
+			_ = pf.ln.Close()
+		}
+		delete(portListeners, port)
+	}
+	portListenersMu.Unlock()
+}
+
 func addRuleHandler(w http.ResponseWriter, r *http.Request) {
 	var rule Rule
 	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rule.SNI = normalizeSNI(rule.SNI)
+	if err := validateRule(&rule); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
+	}
 
 	var count int
 	db.QueryRow("SELECT COUNT(*) FROM rules WHERE name = ?", rule.Name).Scan(&count)
 	if count > 0 {
-		http.Error(w, `{"error":"规则名称宸插瓨鍦?}`, http.StatusConflict)
+		http.Error(w, `{"error":"规则名称已存在"}`, http.StatusConflict)
 		return
 	}
 
 	if rule.Type == RuleTypeSNI {
 		db.QueryRow("SELECT COUNT(*) FROM rules WHERE type = ? AND sni = ?", RuleTypeSNI, rule.SNI).Scan(&count)
 		if count > 0 {
-			http.Error(w, `{"error":"SNI 规则宸插瓨鍦?}`, http.StatusConflict)
+			http.Error(w, `{"error":"SNI 规则已存在"}`, http.StatusConflict)
 			return
 		}
 	} else if rule.Type == RuleTypePort {
 		db.QueryRow("SELECT COUNT(*) FROM rules WHERE type = ? AND listen_port = ?", RuleTypePort, rule.ListenPort).Scan(&count)
 		if count > 0 {
-			http.Error(w, `{"error":"閻╂垵鎯夌粩顖氬經瀹告彃鐡ㄩ崷?}`, http.StatusConflict)
+			http.Error(w, `{"error":"端口规则已存在"}`, http.StatusConflict)
 			return
 		}
 	}
@@ -476,17 +592,46 @@ func updateRuleHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rule.SNI = normalizeSNI(rule.SNI)
+	if err := validateRule(&rule); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	var oldType string
+	var oldPort int
+	if err := db.QueryRow("SELECT type, COALESCE(listen_port, 0) FROM rules WHERE id = ?", id).Scan(&oldType, &oldPort); err != nil {
+		http.Error(w, `{"error":"规则不存在"}`, http.StatusNotFound)
+		return
+	}
+
+	// Update has to reject collisions too, otherwise a rule can be edited onto
+	// another rule's name, SNI or port; duplicate SNIs then collapse in the route
+	// map and one of the two silently stops matching.
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM rules WHERE name = ? AND id <> ?", rule.Name, id).Scan(&count)
+	if count > 0 {
+		http.Error(w, `{"error":"规则名称已存在"}`, http.StatusConflict)
+		return
+	}
+	if rule.Type == RuleTypeSNI {
+		db.QueryRow("SELECT COUNT(*) FROM rules WHERE type = ? AND sni = ? AND id <> ?", RuleTypeSNI, rule.SNI, id).Scan(&count)
+		if count > 0 {
+			http.Error(w, `{"error":"SNI 规则已存在"}`, http.StatusConflict)
+			return
+		}
+	} else {
+		db.QueryRow("SELECT COUNT(*) FROM rules WHERE type = ? AND listen_port = ? AND id <> ?", RuleTypePort, rule.ListenPort, id).Scan(&count)
+		if count > 0 {
+			http.Error(w, `{"error":"端口规则已存在"}`, http.StatusConflict)
+			return
+		}
+	}
 
 	destJSON, _ := json.Marshal(rule.Dest)
 	enabled := 1
 	if !rule.Enabled {
 		enabled = 0
 	}
-
-	var oldType string
-	var oldPort int
-	db.QueryRow("SELECT type, listen_port FROM rules WHERE id = ?", id).Scan(&oldType, &oldPort)
 
 	ruleVersion := incrementConfigVersion()
 
@@ -500,23 +645,22 @@ func updateRuleHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if rule.Type == RuleTypePort {
-		if oldPort != 0 && oldPort != rule.ListenPort {
-			portListenersMu.Lock()
-			if pf, ok := portListeners[oldPort]; ok {
-				pf.cancel()
-				if pf.ln != nil {
-					_ = pf.ln.Close()
-				}
-				delete(portListeners, oldPort)
+	// Stop the old listener whenever it can no longer be correct: the port moved,
+	// the rule was disabled, or it stopped being a port rule at all. Previously
+	// only a port change was handled, so disabling a rule or switching it to SNI
+	// left the old port listening and forwarding traffic.
+	if oldType == RuleTypePort && oldPort != 0 {
+		if rule.Type != RuleTypePort || !rule.Enabled || oldPort != rule.ListenPort {
+			stopPortForwarder(oldPort)
+		}
+	}
+	if rule.Type == RuleTypePort && rule.Enabled {
+		ctx := context.Background()
+		go func() {
+			if err := startPortForwarder(ctx, id, rule.Name, rule.ListenPort, rule.Dest, rule.LBStrategy); err != nil {
+				log.Errorf("start port forwarder for rule %d (:%d) failed: %v", id, rule.ListenPort, err)
 			}
-			portListenersMu.Unlock()
-		}
-
-		if rule.Enabled {
-			ctx := context.Background()
-			go startPortForwarder(ctx, id, rule.Name, rule.ListenPort, rule.Dest, rule.LBStrategy)
-		}
+		}()
 	}
 	if err := rebuildSniRouteCacheFromDB(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

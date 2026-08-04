@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,33 @@ var (
 	}{Status: "idle"}
 )
 
+const dbTimeLayout = "2006-01-02 15:04:05"
+
+func formatDBTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(dbTimeLayout)
+}
+
+// parseDBTime reads a timestamp written by formatDBTime. The stored strings carry
+// no zone, so they have to be read back in the zone that wrote them. time.Parse
+// assumes UTC, which shifted every value by the local offset and made session
+// lifetimes come out wrong by that amount in either direction.
+func parseDBTime(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.ParseInLocation(dbTimeLayout, s, time.Local); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
 func setNodeUpdateState(status, message string) {
 	nodeUpdateMu.Lock()
 	nodeUpdate.Status = strings.TrimSpace(status)
@@ -122,20 +150,82 @@ func setNodeUpdateState(status, message string) {
 	nodeUpdateMu.Unlock()
 }
 
+// getNodeUpdateState reports the pending update state without consuming it.
+// Terminal states (ok/failed) are only cleared by clearNodeUpdateState once the
+// heartbeat carrying them has actually been accepted, otherwise a single failed
+// POST loses the result forever and the panel shows "running" indefinitely.
 func getNodeUpdateState() (string, string, string) {
 	nodeUpdateMu.Lock()
 	defer nodeUpdateMu.Unlock()
 	if nodeUpdate.Status == "" || nodeUpdate.Status == "idle" {
 		return "", "", ""
 	}
-	status := nodeUpdate.Status
-	message := nodeUpdate.Message
-	at := nodeUpdate.At.Format(time.RFC3339)
-	if status == "ok" || status == "failed" {
+	return nodeUpdate.Status, nodeUpdate.Message, nodeUpdate.At.Format(time.RFC3339)
+}
+
+// clearNodeUpdateState retires a terminal state after it has been delivered.
+// reported is the status the successful heartbeat actually carried, so a state
+// that changed in the meantime is left for the next heartbeat.
+func clearNodeUpdateState(reported string) {
+	if reported != "ok" && reported != "failed" {
+		return
+	}
+	nodeUpdateMu.Lock()
+	defer nodeUpdateMu.Unlock()
+	if nodeUpdate.Status == reported {
 		nodeUpdate.Status = "idle"
 		nodeUpdate.Message = ""
 	}
-	return status, message, at
+}
+
+// publicIPCache memoises this node's own public addresses. Resolving them walks
+// up to three external endpoints with a 5s timeout each; doing that inline on
+// every heartbeat could stall the heartbeat loop for ~30s per address family and
+// push the effective interval past the panel's 90s offline threshold, so a node
+// with restricted egress would flap offline while perfectly healthy.
+var publicIPCache = struct {
+	sync.Mutex
+	v map[int]publicIPEntry
+}{v: make(map[int]publicIPEntry)}
+
+type publicIPEntry struct {
+	ip         string
+	expiresAt  time.Time
+	refreshing bool
+}
+
+const publicIPTTL = 10 * time.Minute
+
+// getCachedPublicIP returns the last known address immediately and refreshes it
+// in the background once the TTL lapses, so the heartbeat never blocks on it.
+func getCachedPublicIP(version int) string {
+	now := time.Now()
+	publicIPCache.Lock()
+	entry, ok := publicIPCache.v[version]
+	stale := !ok || now.After(entry.expiresAt)
+	if stale && !entry.refreshing {
+		entry.refreshing = true
+		publicIPCache.v[version] = entry
+		go refreshPublicIP(version)
+	}
+	publicIPCache.Unlock()
+	return entry.ip
+}
+
+func refreshPublicIP(version int) {
+	ip := getPublicIP(version)
+	publicIPCache.Lock()
+	entry := publicIPCache.v[version]
+	entry.refreshing = false
+	// A failed probe keeps the previous value but retries sooner.
+	if ip != "" {
+		entry.ip = ip
+		entry.expiresAt = time.Now().Add(publicIPTTL)
+	} else {
+		entry.expiresAt = time.Now().Add(time.Minute)
+	}
+	publicIPCache.v[version] = entry
+	publicIPCache.Unlock()
 }
 
 func getPublicIP(version int) string {
@@ -652,6 +742,14 @@ func startNode(panelURL, token, nodeID string, pullInterval int) {
 
 	log.Infof("node mode initialized, panel: %s, node_id: %s", panelURL, nodeID)
 
+	if !panelChannelIsSecure() {
+		// Worth stating plainly at startup: over plain HTTP the shared token
+		// travels in clear text on every heartbeat and the responses can be
+		// rewritten in transit, so binary updates are refused (see sendHeartbeat).
+		log.Warnf("SECURITY: panel url %q is not https — the node token is sent in clear text, "+
+			"responses can be tampered with, and binary self-update will be refused. Put the panel behind TLS.", panelURL)
+	}
+
 	go pullConfigFromPanel()
 
 	go heartbeatLoop()
@@ -694,12 +792,29 @@ func runProbing() {
 		return
 	}
 
+	active := make(map[string]struct{})
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
 		}
 		for _, dest := range rule.Dest {
+			active[dest] = struct{}{}
 			go probeTarget(dest)
+		}
+	}
+	pruneProbeCache(active)
+}
+
+// pruneProbeCache drops entries for targets no longer referenced by an enabled
+// rule. Without it the cache only ever grows, and every heartbeat keeps
+// reporting latency for destinations that were deleted long ago — on a
+// long-running node that inflates the heartbeat payload indefinitely.
+func pruneProbeCache(active map[string]struct{}) {
+	probeCacheMu.Lock()
+	defer probeCacheMu.Unlock()
+	for target := range probeCache {
+		if _, ok := active[target]; !ok {
+			delete(probeCache, target)
 		}
 	}
 }
@@ -809,15 +924,16 @@ func sendHeartbeat() {
 
 	req := HeartbeatRequest{
 		NodeID:        nodeID,
-		IPv4:          getPublicIP(4),
-		IPv6:          getPublicIP(6),
+		IPv4:          getCachedPublicIP(4),
+		IPv6:          getCachedPublicIP(6),
 		ConfigVersion: currentVersion,
 		NodeVersion:   NodeVersion,
 		StatusData:    statusData,
 		System:        collectSystemMetrics(),
 	}
-	if status, message, at := getNodeUpdateState(); status != "" {
-		req.UpdateStatus = status
+	reportedStatus, message, at := getNodeUpdateState()
+	if reportedStatus != "" {
+		req.UpdateStatus = reportedStatus
 		req.UpdateMessage = message
 		req.UpdateAt = at
 	}
@@ -854,12 +970,25 @@ func sendHeartbeat() {
 		return
 	}
 
+	// The panel has the result now, so the terminal state can be retired. Doing
+	// this any earlier loses the outcome whenever the POST itself fails.
+	clearNodeUpdateState(reportedStatus)
+
 	if heartbeatResp.NeedUpdate {
 		log.Infof("[Heartbeat] remote version %d is newer than local %d, pulling update...", heartbeatResp.ConfigVersion, currentVersion)
 		pullConfigFromPanel()
 	}
 	if heartbeatResp.NeedBinaryUpdate {
 		log.Infof("[Heartbeat] binary update requested: local=%s latest=%s", NodeVersion, heartbeatResp.LatestVersion)
+		if !panelChannelIsSecure() {
+			// Not fatal, because plenty of panels are reachable only over HTTP and
+			// blocking updates outright would strand them. The protection that
+			// actually matters is validateBinaryURL's host allowlist: with it, a
+			// tampered response can at worst point this node at a genuine release
+			// of this project, not at attacker-supplied code.
+			log.Warnf("panel url is not https: this update instruction cannot be authenticated, " +
+				"and only the download host allowlist is preventing arbitrary code from being installed. Put the panel behind TLS.")
+		}
 		setNodeUpdateState("running", "binary update started")
 		if err := updateBinaryAndExit(heartbeatResp.BinaryURL); err != nil {
 			setNodeUpdateState("failed", fmt.Sprintf("binary update failed: %v", err))
@@ -910,9 +1039,24 @@ func pullConfigFromPanel() {
 func applyConfigFromPanel(configResp ConfigResponse) {
 	configMu.RLock()
 	oldSNIListen := globalConfig.SNIListen
+	localWebPanel := globalConfig.WebPanel
+	localWebAuth := globalConfig.WebAuth
+	localWebTitle := globalConfig.WebTitle
 	configMu.RUnlock()
 
-	if err := saveConfig(configResp.Config); err != nil {
+	// The panel's own web credentials are none of this node's business, and this
+	// node's are none of the panel's. Taking them from the pulled config used to
+	// overwrite the local panel password with whatever the control panel used —
+	// and once the panel stopped sending it, with an empty string, which would
+	// leave this node's own web panel with no password at all.
+	incoming := configResp.Config
+	incoming.WebPanel = localWebPanel
+	incoming.WebAuth = localWebAuth
+	if strings.TrimSpace(incoming.WebTitle) == "" {
+		incoming.WebTitle = localWebTitle
+	}
+
+	if err := saveConfig(incoming); err != nil {
 		log.Errorf("save pulled config failed: %v", err)
 		return
 	}
@@ -926,9 +1070,9 @@ func applyConfigFromPanel(configResp ConfigResponse) {
 	configVersionCounter = configResp.ConfigVersion
 	configVersionMu.Unlock()
 
-	log.Infof("config applied successfully (version: %d, rules: %d, sni_listen: %s)", configResp.ConfigVersion, len(configResp.Rules), configResp.Config.SNIListen)
+	log.Infof("config applied successfully (version: %d, rules: %d, sni_listen: %s)", configResp.ConfigVersion, len(configResp.Rules), incoming.SNIListen)
 
-	if configResp.Config.SNIListen != "" && configResp.Config.SNIListen != oldSNIListen {
+	if incoming.SNIListen != "" && incoming.SNIListen != oldSNIListen {
 		log.Infof("[Sync] SNI listen address changed: %q -> %q, restarting listener...", oldSNIListen, configResp.Config.SNIListen)
 		go restartSNIListener(configResp.Config.SNIListen)
 	}
@@ -1102,9 +1246,98 @@ func updateNodeInDB(node *NodeInfo) {
 		node.ID)
 }
 
+const (
+	// maxBinaryArchiveSize bounds the download. The URL is supplied by the
+	// panel, so an unbounded io.ReadAll would let a wrong or hostile URL exhaust
+	// this node's memory.
+	maxBinaryArchiveSize = 128 << 20 // 128 MiB
+	// maxBinaryPayloadSize bounds the decompressed binary, so a small archive
+	// cannot expand into gigabytes (a decompression bomb).
+	maxBinaryPayloadSize = 256 << 20 // 256 MiB
+	// minBinaryPayloadSize rejects an obviously truncated build before it
+	// replaces a working one.
+	minBinaryPayloadSize = 1 << 20 // 1 MiB
+)
+
+// allowedBinaryHostsEnv lets an operator opt into extra download hosts, as a
+// comma-separated list. Anything not listed is refused rather than warned about:
+// the URL arrives in an unauthenticated heartbeat response, so treating an
+// unexpected host as merely noteworthy is what turns a hijacked response into
+// arbitrary root code execution on this node.
+const allowedBinaryHostsEnv = "XPN_ALLOWED_BINARY_HOSTS"
+
+func binaryHostAllowed(host string) bool {
+	host = strings.ToLower(host)
+	if host == "github.com" || strings.HasSuffix(host, ".github.com") {
+		return true
+	}
+	for _, extra := range strings.Split(os.Getenv(allowedBinaryHostsEnv), ",") {
+		extra = strings.ToLower(strings.TrimSpace(extra))
+		if extra != "" && extra == host {
+			return true
+		}
+	}
+	return false
+}
+
+// validateBinaryURL decides whether a URL handed to us by the panel may be used
+// to replace this node's own executable.
+//
+// The sha256 companion file is fetched from the same origin as the archive, so
+// it can only prove the download was not corrupted in transit — it proves
+// nothing about who produced the binary. There is also no authentication on the
+// heartbeat *response*: the node signs its requests with the shared token, but
+// anything coming back is taken on faith. So the transport and the origin are
+// the only things standing between a hijacked response and root code execution,
+// and both are enforced here rather than merely logged.
+func validateBinaryURL(raw string) error {
+	u, err := neturl.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("invalid binary url: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("refusing to update over %q: binary url must use https", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid binary url: missing host")
+	}
+	if !binaryHostAllowed(u.Host) {
+		return fmt.Errorf("refusing to fetch node binary from unapproved host %q (set %s to allow it)", u.Host, allowedBinaryHostsEnv)
+	}
+	return nil
+}
+
+// panelChannelIsSecure reports whether the control channel itself is protected.
+// A plain-HTTP panel URL means the heartbeat response can be rewritten by anyone
+// on the path, so a "replace your executable" instruction arriving over it
+// cannot be trusted at all — config sync over HTTP is merely an information
+// leak, but honouring a binary swap would be handing over the machine.
+func panelChannelIsSecure() bool {
+	panelConfigMu.RLock()
+	raw := strings.TrimSpace(panelConfig.PanelURL)
+	panelConfigMu.RUnlock()
+
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, "https")
+}
+
+// looksLikeLinuxExecutable checks the ELF magic. A matching sha256 only proves
+// the archive arrived intact, not that it contains a runnable build; without
+// this check a bad release would be swapped in, fail to exec, and leave systemd
+// restart-looping with no working binary to fall back to.
+func looksLikeLinuxExecutable(payload []byte) bool {
+	return len(payload) >= 4 && payload[0] == 0x7f && payload[1] == 'E' && payload[2] == 'L' && payload[3] == 'F'
+}
+
 func updateBinaryAndExit(url string) error {
 	if strings.TrimSpace(url) == "" {
 		url = binaryURLForVersion(NodeVersion)
+	}
+	if err := validateBinaryURL(url); err != nil {
+		return err
 	}
 
 	resp, err := (&http.Client{Timeout: 2 * time.Minute}).Get(url)
@@ -1115,9 +1348,12 @@ func updateBinaryAndExit(url string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download binary failed: status %d", resp.StatusCode)
 	}
-	archiveBytes, err := io.ReadAll(resp.Body)
+	archiveBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxBinaryArchiveSize+1))
 	if err != nil {
 		return err
+	}
+	if len(archiveBytes) > maxBinaryArchiveSize {
+		return fmt.Errorf("binary package exceeds %d bytes", maxBinaryArchiveSize)
 	}
 
 	expectedSHA, err := fetchExpectedSHA256(url)
@@ -1146,10 +1382,18 @@ func updateBinaryAndExit(url string) error {
 		if err != nil {
 			return err
 		}
-		if filepath.Base(hdr.Name) == "xpn-node" {
-			payload, err = io.ReadAll(tr)
+		// Only a regular file is a candidate. Matching on the base name alone
+		// would otherwise happily accept a directory or symlink entry.
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		if filepath.Base(filepath.Clean(hdr.Name)) == "xpn-node" {
+			payload, err = io.ReadAll(io.LimitReader(tr, maxBinaryPayloadSize+1))
 			if err != nil {
 				return err
+			}
+			if len(payload) > maxBinaryPayloadSize {
+				return fmt.Errorf("extracted binary exceeds %d bytes", maxBinaryPayloadSize)
 			}
 			break
 		}
@@ -1157,28 +1401,55 @@ func updateBinaryAndExit(url string) error {
 	if len(payload) == 0 {
 		return fmt.Errorf("binary xpn-node not found in package")
 	}
+	if len(payload) < minBinaryPayloadSize {
+		return fmt.Errorf("extracted binary is only %d bytes, refusing to install it", len(payload))
+	}
+	if !looksLikeLinuxExecutable(payload) {
+		return fmt.Errorf("extracted binary is not an ELF executable, refusing to install it")
+	}
 
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
+		exePath = resolved
+	}
 	dir := filepath.Dir(exePath)
 	newPath := filepath.Join(dir, "xpn-node.new")
 	backupPath := filepath.Join(dir, "xpn-node.bak")
 
-	if err := os.WriteFile(newPath, payload, 0755); err != nil {
+	if err := os.WriteFile(newPath, payload, 0o755); err != nil {
 		return err
 	}
+	// Any failure from here on must not leave the staged file behind.
+	installed := false
+	defer func() {
+		if !installed {
+			_ = os.Remove(newPath)
+		}
+	}()
+
 	_ = os.Remove(backupPath)
 	if err := os.Rename(exePath, backupPath); err != nil {
 		return err
 	}
 	if err := os.Rename(newPath, exePath); err != nil {
-		_ = os.Rename(backupPath, exePath)
+		// Put the working binary back before giving up, otherwise the service
+		// has no executable at all.
+		if rbErr := os.Rename(backupPath, exePath); rbErr != nil {
+			log.Errorf("CRITICAL: failed to restore previous binary from %s: %v", backupPath, rbErr)
+		}
 		return err
 	}
+	installed = true
 
-	log.Infof("binary updated successfully, exiting for service restart")
+	log.Infof("binary updated successfully (%d bytes), exiting for service restart", len(payload))
+	// os.Exit skips deferred cleanup, so close the database explicitly to let
+	// SQLite checkpoint its WAL before the process disappears.
+	if db != nil {
+		_ = db.Close()
+	}
 	os.Exit(0)
 	return nil
 }
@@ -1193,7 +1464,9 @@ func fetchExpectedSHA256(binaryURL string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download sha256 failed: status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	// A checksum file is a few dozen bytes; cap the read so a wrong URL serving
+	// something huge cannot be slurped into memory.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
 		return "", err
 	}

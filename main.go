@@ -41,7 +41,7 @@ const (
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.11"
+	NodeVersion  = "v1.1.12"
 )
 
 func binaryURLForVersion(version string) string {
@@ -117,6 +117,7 @@ var (
 
 	sniListenerCancel context.CancelFunc
 	sniListenerLn     net.Listener
+	sniListenerAddr   string
 	sniListenerMu     sync.Mutex
 	mainCtx           context.Context
 )
@@ -594,11 +595,21 @@ func setLogLevel(lvl string) {
 	log.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 }
 
+// sniRestartMu serialises listener restarts. Two concurrent restarts used to
+// race on the same address: each cancelled the other's context and both could
+// then fail to bind or immediately shut down again, leaving nothing listening.
+var sniRestartMu sync.Mutex
+
 func restartSNIListener(addr string) {
 	if addr != "" && !strings.Contains(addr, ":") {
 		addr = ":" + addr
 	}
+
+	sniRestartMu.Lock()
+	defer sniRestartMu.Unlock()
+
 	sniListenerMu.Lock()
+	previousAddr := sniListenerAddr
 	if sniListenerLn != nil {
 		sniListenerLn.Close()
 		sniListenerLn = nil
@@ -608,10 +619,58 @@ func restartSNIListener(addr string) {
 	}
 	sniCtx, cancel := context.WithCancel(mainCtx)
 	sniListenerCancel = cancel
+	sniListenerAddr = addr
 	sniListenerMu.Unlock()
 
+	// Give the old listener a moment to release the port before rebinding.
 	time.Sleep(200 * time.Millisecond)
-	startSNIListener(sniCtx, addr)
+
+	if bindSNIListener(sniCtx, addr) {
+		return
+	}
+
+	// The new address is unusable. Falling back to the previous one keeps this
+	// node forwarding traffic instead of going dark until someone changes the
+	// configuration again — on a node, no listener means a full outage.
+	if previousAddr != "" && previousAddr != addr {
+		log.Warnf("SNI listen %s failed, falling back to previous address %s", addr, previousAddr)
+		sniListenerMu.Lock()
+		sniListenerAddr = previousAddr
+		sniListenerMu.Unlock()
+		if bindSNIListener(sniCtx, previousAddr) {
+			return
+		}
+	}
+	log.Errorf("SNI listener is down: neither %s nor %s could be bound", addr, previousAddr)
+}
+
+// bindSNIListener tries to bind addr, retrying briefly because the previous
+// listener's socket may still be in TIME_WAIT or a peer process may be exiting.
+// It reports whether the accept loop was handed a live listener.
+func bindSNIListener(ctx context.Context, addr string) bool {
+	const attempts = 5
+	delay := 200 * time.Millisecond
+	for attempt := 1; attempt <= attempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			go serveSNIListener(ctx, addr, ln)
+			return true
+		}
+		log.Errorf("SNI listen %s (attempt %d/%d): %v", addr, attempt, attempts, err)
+		if attempt < attempts {
+			time.Sleep(delay)
+			if delay < 2*time.Second {
+				delay *= 2
+			}
+		}
+	}
+	return false
 }
 
 func startSNIListener(ctx context.Context, addr string) {
@@ -620,7 +679,10 @@ func startSNIListener(ctx context.Context, addr string) {
 		log.Errorf("SNI listen %s: %v", addr, err)
 		return
 	}
+	serveSNIListener(ctx, addr, ln)
+}
 
+func serveSNIListener(ctx context.Context, addr string, ln net.Listener) {
 	select {
 	case <-ctx.Done():
 		ln.Close()
@@ -643,6 +705,7 @@ func startSNIListener(ctx context.Context, addr string) {
 	log.Infof("SNI listener started on %s", addr)
 
 	var wg sync.WaitGroup
+	acceptDelay := time.Duration(0)
 	for {
 		select {
 		case <-ctx.Done():
@@ -656,9 +719,24 @@ func startSNIListener(ctx context.Context, addr string) {
 			if strings.Contains(err.Error(), "use of closed") {
 				break
 			}
-			log.Errorf("SNI accept: %v", err)
+			// Back off on transient errors. Without this, a condition that
+			// persists — file descriptor exhaustion being the classic one on a
+			// busy node — turns this into a hot loop that pins a core and
+			// floods the log.
+			if acceptDelay == 0 {
+				acceptDelay = 5 * time.Millisecond
+			} else if acceptDelay < time.Second {
+				acceptDelay *= 2
+			}
+			log.Errorf("SNI accept (retry in %v): %v", acceptDelay, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(acceptDelay):
+			}
 			continue
 		}
+		acceptDelay = 0
 
 		wg.Add(1)
 		go func(c net.Conn) {
@@ -673,7 +751,17 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	clientAddr := client.RemoteAddr().String()
 
 	_ = client.SetDeadline(time.Now().Add(handshakeTimeout))
-	br := bufio.NewReaderSize(client, 64*1024)
+
+	// A ClientHello is normally well under 2 KiB; 20 KiB covers a full-length
+	// record while costing a third of the previous fixed 64 KiB per connection.
+	// The reader is pooled because it is only needed for the handshake, not for
+	// the lifetime of the connection.
+	br := handshakeReaderPool.Get().(*bufio.Reader)
+	br.Reset(client)
+	defer func() {
+		br.Reset(nil)
+		handshakeReaderPool.Put(br)
+	}()
 
 	sni, peeked, err := peekClientHelloSNI(br)
 	if err != nil {
@@ -699,9 +787,11 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	}
 	defer backendConn.Close()
 
-	deadline := time.Now().Add(transferTimeout)
-	_ = client.SetDeadline(deadline)
-	_ = backendConn.SetDeadline(deadline)
+	// The absolute cap now lives in sessionActivity. Setting it on the conns
+	// here had no effect: proxyWithIdleTimeout resets the read/write deadlines
+	// on every pass, so this deadline was always overwritten before it fired.
+	_ = client.SetDeadline(time.Time{})
+	_ = backendConn.SetDeadline(time.Time{})
 
 	if len(peeked) > 0 {
 		backendConn.Write(peeked)
@@ -712,9 +802,10 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		backendConn.Write(buf)
 	}
 
+	activity := newSessionActivity(transferTimeout)
 	done := make(chan struct{}, 2)
-	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, clientAddr, "c->b")
-	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, clientAddr, "b->c")
+	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b")
+	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c")
 
 	select {
 	case <-done:
@@ -965,6 +1056,7 @@ func startPortForwarder(ctx context.Context, ruleID int, name string, port int, 
 		defer ln.Close()
 		var counter uint64
 		var wg sync.WaitGroup
+		acceptDelay := time.Duration(0)
 
 		for {
 			select {
@@ -979,8 +1071,24 @@ func startPortForwarder(ctx context.Context, ruleID int, name string, port int, 
 				if strings.Contains(err.Error(), "use of closed") {
 					return
 				}
+				// Same backoff as the SNI listener. This loop used to spin
+				// silently on a persistent error, with no log line at all to
+				// explain the CPU burn.
+				if acceptDelay == 0 {
+					acceptDelay = 5 * time.Millisecond
+				} else if acceptDelay < time.Second {
+					acceptDelay *= 2
+				}
+				log.Errorf("port %d accept (retry in %v): %v", port, acceptDelay, err)
+				select {
+				case <-portCtx.Done():
+					wg.Wait()
+					return
+				case <-time.After(acceptDelay):
+				}
 				continue
 			}
+			acceptDelay = 0
 
 			wg.Add(1)
 			go func(c net.Conn) {
@@ -1020,18 +1128,18 @@ func handlePortForward(client net.Conn, dests []string, lbStrategy string, count
 	}
 	defer backendConn.Close()
 
-	deadline := time.Now().Add(transferTimeout)
-	_ = client.SetDeadline(deadline)
-	_ = backendConn.SetDeadline(deadline)
+	_ = client.SetDeadline(time.Time{})
+	_ = backendConn.SetDeadline(time.Time{})
 
 	log.WithFields(logrus.Fields{
 		"client":  clientAddr,
 		"backend": backend,
 	}).Debug("port forward")
 
+	activity := newSessionActivity(transferTimeout)
 	done := make(chan struct{}, 2)
-	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, clientAddr, "c->b")
-	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, clientAddr, "b->c")
+	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b")
+	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c")
 
 	select {
 	case <-done:
@@ -1087,7 +1195,63 @@ func selectBackend(dests []string, strategy string, counter *uint64) string {
 	}
 }
 
-func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.Duration, clientAddr, direction string) {
+// handshakeReaderPool recycles the buffered readers used to peek a ClientHello.
+// The size has to exceed maxTLSRecord so a full-length record can still be
+// peeked whole, with slack left for reassembling a fragmented handshake.
+const handshakeBufSize = 20 * 1024
+
+var handshakeReaderPool = sync.Pool{
+	New: func() any {
+		return bufio.NewReaderSize(nil, handshakeBufSize)
+	},
+}
+
+// copyBufPool recycles the 32 KiB relay buffers. Each connection needs two of
+// them (one per direction); allocating them per connection made buffer memory
+// scale linearly with concurrency and handed the GC a large short-lived object
+// for every new connection.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+// sessionActivity is shared by both directions of one proxied connection so the
+// idle timer reflects the connection as a whole.
+type sessionActivity struct {
+	lastActive atomic.Int64 // unix nanoseconds
+	deadline   time.Time    // absolute cap for the whole session
+}
+
+func newSessionActivity(total time.Duration) *sessionActivity {
+	s := &sessionActivity{deadline: time.Now().Add(total)}
+	s.touch()
+	return s
+}
+
+func (s *sessionActivity) touch() {
+	s.lastActive.Store(time.Now().UnixNano())
+}
+
+func (s *sessionActivity) idleFor() time.Duration {
+	return time.Since(time.Unix(0, s.lastActive.Load()))
+}
+
+// proxyWithIdleTimeout relays src into dst until the connection as a whole goes
+// idle or exceeds its total lifetime.
+//
+// Idleness is tracked per connection, not per direction. Judging each direction
+// on its own meant a long download — where the client sends nothing but ACKs for
+// minutes — looked idle from the client side, and the resulting CloseWrite sent
+// the backend an EOF that aborted the transfer mid-flight.
+//
+// The read deadline is a short polling tick rather than the full idle timeout so
+// that the shared timestamp and the absolute deadline are re-checked regularly.
+// That absolute deadline is what makes transferTimeout real: previously every
+// read reset the connection deadline set by the caller, so the intended 2 hour
+// cap could never fire.
+func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.Duration, activity *sessionActivity, direction string) {
 	defer func() {
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -1095,27 +1259,56 @@ func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.
 		done <- struct{}{}
 	}()
 
-	buf := make([]byte, 64*1024)
-	for {
-		_ = src.SetReadDeadline(time.Now().Add(timeout))
-		n, err := src.Read(buf)
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	buf := *bufPtr
 
+	const pollInterval = 5 * time.Second
+
+	for {
+		now := time.Now()
+		if !activity.deadline.IsZero() && now.After(activity.deadline) {
+			log.Debugf("proxy %s closed: exceeded total transfer timeout", direction)
+			return
+		}
+		if activity.idleFor() >= timeout {
+			log.Debugf("proxy %s closed: idle for %v", direction, activity.idleFor())
+			return
+		}
+
+		wake := now.Add(pollInterval)
+		if !activity.deadline.IsZero() && activity.deadline.Before(wake) {
+			wake = activity.deadline
+		}
+		_ = src.SetReadDeadline(wake)
+
+		n, err := src.Read(buf)
 		if n > 0 {
+			activity.touch()
 			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
 			}
+			activity.touch()
 		}
 
 		if err != nil {
+			// A read deadline hit is just our polling tick: loop round and let
+			// the checks above decide whether the connection is really done.
+			var nerr net.Error
+			if errors.As(err, &nerr) && nerr.Timeout() {
+				continue
+			}
 			return
 		}
 	}
 }
 
-func peekClientHelloSNI(br *bufio.Reader) (string, []byte, error) {
-	const maxRecord = 64 * 1024
+// maxTLSRecord is the largest a single TLS record can be: a 5 byte header plus
+// the 2^14 byte maximum payload.
+const maxTLSRecord = 5 + 16384
 
+func peekClientHelloSNI(br *bufio.Reader) (string, []byte, error) {
 	readBuffered := func(n int) []byte {
 		if n <= 0 {
 			n = br.Buffered()
@@ -1135,32 +1328,89 @@ func peekClientHelloSNI(br *bufio.Reader) (string, []byte, error) {
 		return "", peeked, errors.New("not a TLS handshake record")
 	}
 
-	recLen := int(hdr[3])<<8 | int(hdr[4])
-	if recLen <= 0 || recLen > maxRecord-5 {
-		peeked := readBuffered(0)
-		return "", peeked, fmt.Errorf("invalid TLS record length: %d", recLen)
+	// RFC 8446 §5.1 allows a handshake message to span several records, and some
+	// clients deliberately fragment their ClientHello. Walk records until the
+	// whole message is in hand instead of giving up on the first one, which used
+	// to send every fragmented handshake to the default backend.
+	var (
+		handshake []byte
+		// owned records whether handshake has its own backing array. The first
+		// fragment aliases the reader's buffer to avoid a copy in the common
+		// single-record case; anything appended after that must go into a buffer
+		// we own, or append would write straight into the reader's buffer and
+		// corrupt the very bytes we still have to relay to the backend.
+		owned bool
+		total int
+	)
+	for {
+		if total+5 > handshakeBufSize {
+			break
+		}
+		framed, err := br.Peek(total + 5)
+		if err != nil || len(framed) < total+5 {
+			break
+		}
+		recHdr := framed[total : total+5]
+		if recHdr[0] != 0x16 {
+			break
+		}
+		recLen := int(recHdr[3])<<8 | int(recHdr[4])
+		if recLen <= 0 || recLen > maxTLSRecord-5 {
+			if total == 0 {
+				peeked := readBuffered(0)
+				return "", peeked, fmt.Errorf("invalid TLS record length: %d", recLen)
+			}
+			break
+		}
+		end := total + 5 + recLen
+		if end > handshakeBufSize {
+			break
+		}
+		full, err := br.Peek(end)
+		if err != nil || len(full) < end {
+			if total == 0 {
+				peeked := readBuffered(0)
+				return "", peeked, fmt.Errorf("incomplete TLS record: %v", err)
+			}
+			break
+		}
+
+		fragment := full[total+5 : end]
+		if handshake == nil {
+			// Common case: one record holds the entire ClientHello, so alias the
+			// peek buffer rather than copying it.
+			handshake = fragment
+		} else {
+			if !owned {
+				merged := make([]byte, len(handshake), len(handshake)+len(fragment)+512)
+				copy(merged, handshake)
+				handshake = merged
+				owned = true
+			}
+			handshake = append(handshake, fragment...)
+		}
+		total = end
+
+		if len(handshake) >= 4 {
+			want := 4 + (int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3]))
+			if len(handshake) >= want {
+				break
+			}
+		}
 	}
 
-	total := 5 + recLen
-	rec, err := br.Peek(total)
-	if err != nil || len(rec) < total {
-		peeked := readBuffered(0)
-		return "", peeked, fmt.Errorf("incomplete TLS record: %v", err)
-	}
-
-	payload := rec[5:total]
-	if len(payload) < 4 || payload[0] != 0x01 {
+	if len(handshake) < 4 || handshake[0] != 0x01 {
 		peeked := readBuffered(total)
 		return "", peeked, errors.New("not ClientHello")
 	}
 
-	hlen := int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
-	if hlen+4 > len(payload) {
+	hlen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+	if hlen+4 > len(handshake) {
 		peeked := readBuffered(total)
 		return "", peeked, errors.New("truncated ClientHello")
 	}
 
-	ch := payload[4 : 4+hlen]
+	ch := handshake[4 : 4+hlen]
 	if len(ch) < 34 {
 		peeked := readBuffered(total)
 		return "", peeked, errors.New("short ClientHello")
