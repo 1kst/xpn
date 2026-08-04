@@ -1194,19 +1194,36 @@ func applyRules(rules []Rule, configVersion int) error {
 			enabled = 1
 		}
 
-		result, err := tx.Exec(`
-			INSERT INTO rules (name, type, sni, listen_port, dest, lb_strategy, enabled, version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion)
-
-		if err != nil {
+		// The panel's id is stored, not left to AUTOINCREMENT. These ids are what
+		// the traffic counters report back, and the panel resolves them against its
+		// own rules table: a local id means nothing there. Because this function
+		// deletes and reinserts every rule on each config push, the local sequence
+		// climbed by the whole rule count every time, so the reported ids were not
+		// merely wrong but different on every push -- the panel labelled all of
+		// them "(deleted #id)" and per-rule traffic could never be attributed.
+		ruleID := rule.ID
+		if ruleID <= 0 {
+			// A panel too old to send ids leaves attribution impossible either way;
+			// let SQLite assign one so the rule itself still works.
+			result, err := tx.Exec(`
+				INSERT INTO rules (name, type, sni, listen_port, dest, lb_strategy, enabled, version)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion)
+			if err != nil {
+				return err
+			}
+			id, _ := result.LastInsertId()
+			ruleID = int(id)
+		} else if _, err := tx.Exec(`
+			INSERT INTO rules (id, name, type, sni, listen_port, dest, lb_strategy, enabled, version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, ruleID, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion); err != nil {
 			return err
 		}
 
 		if rule.Type == RuleTypePort && rule.Enabled {
-			id, _ := result.LastInsertId()
 			portStarts = append(portStarts, portStart{
-				id:       int(id),
+				id:       ruleID,
 				name:     rule.Name,
 				port:     rule.ListenPort,
 				dest:     rule.Dest,
