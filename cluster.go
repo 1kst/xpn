@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -79,11 +81,17 @@ type SystemMetrics struct {
 }
 
 type HeartbeatRequest struct {
-	NodeID        string         `json:"node_id"`
-	IPv4          string         `json:"ipv4"`
-	IPv6          string         `json:"ipv6"`
-	ConfigVersion int            `json:"config_version"`
-	NodeVersion   string         `json:"node_version"`
+	NodeID        string `json:"node_id"`
+	IPv4          string `json:"ipv4"`
+	IPv6          string `json:"ipv6"`
+	ConfigVersion int    `json:"config_version"`
+	NodeVersion   string `json:"node_version"`
+	// Arch is this build's GOARCH, so the panel can hand out the release asset
+	// this machine can actually run. Without it the panel derives one URL from a
+	// version tag for the whole fleet, which is how an arm64 node came to be
+	// offered the amd64 build. A panel too old to read this field simply keeps
+	// sending what it always did.
+	Arch          string         `json:"arch,omitempty"`
 	StatusData    map[string]int `json:"status_data"`
 	System        *SystemMetrics `json:"system,omitempty"`
 	UpdateStatus  string         `json:"update_status,omitempty"`
@@ -1056,6 +1064,7 @@ func sendHeartbeat() {
 		IPv6:          getCachedPublicIP(6),
 		ConfigVersion: currentVersion,
 		NodeVersion:   NodeVersion,
+		Arch:          runtime.GOARCH,
 		StatusData:    statusData,
 		System:        collectSystemMetrics(),
 		Traffic:       collectTrafficCounters(),
@@ -1489,6 +1498,49 @@ func looksLikeLinuxExecutable(payload []byte) bool {
 	return len(payload) >= 4 && payload[0] == 0x7f && payload[1] == 'E' && payload[2] == 'L' && payload[3] == 'F'
 }
 
+// expectedELFMachine is the ELF machine type a binary must declare to be
+// runnable on this build's architecture. An architecture missing from this table
+// is not judged, so an exotic platform is never blocked by a check that cannot
+// speak for it.
+var expectedELFMachine = map[string]elf.Machine{
+	"amd64":    elf.EM_X86_64,
+	"arm64":    elf.EM_AARCH64,
+	"386":      elf.EM_386,
+	"arm":      elf.EM_ARM,
+	"riscv64":  elf.EM_RISCV,
+	"ppc64le":  elf.EM_PPC64,
+	"s390x":    elf.EM_S390,
+	"mips64le": elf.EM_MIPS,
+}
+
+// checkExecutableMatchesHost refuses a binary built for another architecture.
+//
+// The ELF magic alone does not distinguish an amd64 build from an arm64 one, and
+// the panel derives the download URL from a version tag without knowing what a
+// given node runs — so an arm64 node could be handed the amd64 asset, pass every
+// other check, install it, and then fail to exec. With Restart=always that is
+// not a failed update but a bricked machine: systemd restart-loops a binary the
+// kernel refuses to run, and the only way back is SSH. The node is the one party
+// that knows its own architecture for certain, so it is the right place to say no.
+//
+// Refusing here leaves the working binary untouched and reports "failed" to the
+// panel on the next heartbeat, which is a recoverable outcome.
+func checkExecutableMatchesHost(payload []byte) error {
+	want, known := expectedELFMachine[runtime.GOARCH]
+	if !known {
+		return nil
+	}
+	f, err := elf.NewFile(bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("cannot read ELF header: %w", err)
+	}
+	if f.Machine != want {
+		return fmt.Errorf("binary is built for %s but this node is %s (%s); refusing to install it",
+			f.Machine, runtime.GOARCH, want)
+	}
+	return nil
+}
+
 func updateBinaryAndExit(url string) error {
 	if strings.TrimSpace(url) == "" {
 		url = binaryURLForVersion(NodeVersion)
@@ -1563,6 +1615,9 @@ func updateBinaryAndExit(url string) error {
 	}
 	if !looksLikeLinuxExecutable(payload) {
 		return fmt.Errorf("extracted binary is not an ELF executable, refusing to install it")
+	}
+	if err := checkExecutableMatchesHost(payload); err != nil {
+		return err
 	}
 
 	exePath, err := os.Executable()

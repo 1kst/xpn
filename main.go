@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,8 +37,18 @@ const (
 	dnsCacheTTL      = 60 * time.Second
 	dnsNegativeTTL   = 5 * time.Second
 	dnsLookupTimeout = 2 * time.Second
-	DefaultBinaryURL = "https://github.com/1kst/xpn/releases/latest/download/xpn-node-linux-amd64.tar.gz"
 )
+
+// DefaultBinaryURL is the fallback download for this node's own architecture.
+//
+// It used to be a constant naming amd64, so an arm64 node fell back to
+// downloading the amd64 build of itself. runtime.GOARCH is the same value the
+// CI uses in the asset name and the installer derives from `uname -m`, so the
+// three agree; an architecture with no published asset now 404s, which is a
+// clearer failure than fetching a binary this machine cannot run.
+func DefaultBinaryURL() string {
+	return fmt.Sprintf("https://github.com/1kst/xpn/releases/latest/download/xpn-node-linux-%s.tar.gz", runtime.GOARCH)
+}
 
 var (
 	PanelVersion = "v1.0"
@@ -47,9 +58,9 @@ var (
 func binaryURLForVersion(version string) string {
 	v := strings.TrimSpace(version)
 	if v == "" {
-		return DefaultBinaryURL
+		return DefaultBinaryURL()
 	}
-	return fmt.Sprintf("https://github.com/1kst/xpn/releases/download/%s/xpn-node-linux-amd64.tar.gz", v)
+	return fmt.Sprintf("https://github.com/1kst/xpn/releases/download/%s/xpn-node-linux-%s.tar.gz", v, runtime.GOARCH)
 }
 
 const (
