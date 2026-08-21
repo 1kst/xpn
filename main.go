@@ -52,7 +52,7 @@ func DefaultBinaryURL() string {
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.16"
+	NodeVersion  = "v1.1.17"
 )
 
 func binaryURLForVersion(version string) string {
