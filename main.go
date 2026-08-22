@@ -46,13 +46,17 @@ const (
 // CI uses in the asset name and the installer derives from `uname -m`, so the
 // three agree; an architecture with no published asset now 404s, which is a
 // clearer failure than fetching a binary this machine cannot run.
+//
+// It and binaryURLForVersion both derive from NodeReleaseOrigin, the constant
+// validateBinaryURL pins downloads to, so a URL this node builds for itself can
+// never fall outside what it is willing to accept.
 func DefaultBinaryURL() string {
-	return fmt.Sprintf("https://github.com/1kst/xpn/releases/latest/download/xpn-node-linux-%s.tar.gz", runtime.GOARCH)
+	return NodeReleaseOrigin + fmt.Sprintf("latest/download/xpn-node-linux-%s.tar.gz", runtime.GOARCH)
 }
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.17"
+	NodeVersion  = "v1.1.18"
 )
 
 func binaryURLForVersion(version string) string {
@@ -60,7 +64,7 @@ func binaryURLForVersion(version string) string {
 	if v == "" {
 		return DefaultBinaryURL()
 	}
-	return fmt.Sprintf("https://github.com/1kst/xpn/releases/download/%s/xpn-node-linux-%s.tar.gz", v, runtime.GOARCH)
+	return NodeReleaseOrigin + fmt.Sprintf("download/%s/xpn-node-linux-%s.tar.gz", v, runtime.GOARCH)
 }
 
 const (

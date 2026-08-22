@@ -16,6 +16,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -879,11 +880,14 @@ func startNode(panelURL, token, nodeID string, pullInterval int) {
 	log.Infof("node mode initialized, panel: %s, node_id: %s, boot: %s", panelURL, nodeID, bootID)
 
 	if !panelChannelIsSecure() {
-		// Worth stating plainly at startup: over plain HTTP the shared token
-		// travels in clear text on every heartbeat and the responses can be
-		// rewritten in transit, so binary updates are refused (see sendHeartbeat).
-		log.Warnf("SECURITY: panel url %q is not https — the node token is sent in clear text, "+
-			"responses can be tampered with, and binary self-update will be refused. Put the panel behind TLS.", panelURL)
+		// Stated plainly at startup, and stated accurately: this used to claim
+		// updates "will be refused", which sendHeartbeat does not do -- it warns
+		// and proceeds. An operator reading that had every reason to believe the
+		// dangerous capability was off on this channel.
+		log.Warnf("SECURITY: panel url %q is not https — the node token is sent in clear text on every "+
+			"heartbeat, and responses can be rewritten in transit. A rewritten response CAN still start a "+
+			"self-update: %s is pinned as the only download origin, so it cannot install foreign code, but it "+
+			"can be aimed at another release of this project. Put the panel behind TLS.", panelURL, NodeReleaseOrigin)
 	}
 
 	go pullConfigFromPanel()
@@ -1120,12 +1124,16 @@ func sendHeartbeat() {
 		log.Infof("[Heartbeat] binary update requested: local=%s latest=%s", NodeVersion, heartbeatResp.LatestVersion)
 		if !panelChannelIsSecure() {
 			// Not fatal, because plenty of panels are reachable only over HTTP and
-			// blocking updates outright would strand them. The protection that
-			// actually matters is validateBinaryURL's host allowlist: with it, a
-			// tampered response can at worst point this node at a genuine release
-			// of this project, not at attacker-supplied code.
-			log.Warnf("panel url is not https: this update instruction cannot be authenticated, " +
-				"and only the download host allowlist is preventing arbitrary code from being installed. Put the panel behind TLS.")
+			// blocking updates outright would strand them. What keeps that tolerable
+			// is that validateBinaryURL pins the origin down to this project's
+			// releases: a tampered response can at worst aim this node at another
+			// release of this project. It used to pin only the host, and GitHub lets
+			// anyone publish a release, so at that point the same tampered response
+			// could install anything.
+			log.Warnf("panel url is not https: this update instruction cannot be authenticated. "+
+				"The download origin is pinned to %s, which is the only thing preventing foreign code from "+
+				"being installed; a downgrade to an older release of this project is still possible. Put the panel behind TLS.",
+				NodeReleaseOrigin)
 		}
 		setNodeUpdateState("running", "binary update started")
 		if err := updateBinaryAndExit(heartbeatResp.BinaryURL); err != nil {
@@ -1425,59 +1433,150 @@ const (
 	minBinaryPayloadSize = 1 << 20 // 1 MiB
 )
 
-// allowedBinaryHostsEnv lets an operator opt into extra download hosts, as a
-// comma-separated list. Anything not listed is refused rather than warned about:
-// the URL arrives in an unauthenticated heartbeat response, so treating an
-// unexpected host as merely noteworthy is what turns a hijacked response into
-// arbitrary root code execution on this node.
-const allowedBinaryHostsEnv = "XPN_ALLOWED_BINARY_HOSTS"
+// NodeReleaseOrigin is the one place a node will fetch a replacement for its own
+// executable from: this project's releases, and nothing else under that host.
+//
+// Pinning the owner and repository, not merely the host, is the point. The check
+// used to accept any host equal to or ending in github.com, and GitHub lets
+// anyone publish a release — so every account on it could supply the binary this
+// node installs and runs as root. Combined with a plain-HTTP panel URL, which the
+// node tolerates for config, one rewritten heartbeat response was enough.
+const NodeReleaseOrigin = "https://github.com/1kst/xpn/releases/"
 
-func binaryHostAllowed(host string) bool {
-	host = strings.ToLower(host)
-	if host == "github.com" || strings.HasSuffix(host, ".github.com") {
-		return true
+// allowedBinaryPrefixEnv lets an operator pin somewhere else instead — a private
+// mirror, say. It takes whole URL prefixes rather than bare hosts, so an operator
+// using it still pins a path: a host-only escape hatch would have re-opened
+// exactly the hole this closes.
+const allowedBinaryPrefixEnv = "XPN_ALLOWED_BINARY_PREFIX"
+
+// binaryRedirectSuffix is where a GitHub release download is handed off to
+// (currently release-assets.githubusercontent.com; it was objects. before that).
+// Redirects were followed without any check at all, which made the check on the
+// first URL the only one there was — and that host is not on the github.com list
+// the old check used, which is how the gap went unnoticed.
+const binaryRedirectSuffix = ".githubusercontent.com"
+
+// maxBinaryRedirects bounds the chain. Go's default is 10; a release download
+// takes one hop.
+const maxBinaryRedirects = 5
+
+// urlOrigin is a download location reduced to the parts worth comparing.
+type urlOrigin struct {
+	host string
+	path string
+}
+
+// parseBinaryOrigin normalises a URL for comparison: lowercased hostname, port
+// dropped when it is the default, and a cleaned path so that "/a/b/../../c"
+// cannot masquerade as living under "/a/b/".
+func parseBinaryOrigin(raw string) (urlOrigin, error) {
+	u, err := neturl.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return urlOrigin{}, fmt.Errorf("invalid binary url: %w", err)
 	}
-	for _, extra := range strings.Split(os.Getenv(allowedBinaryHostsEnv), ",") {
-		extra = strings.ToLower(strings.TrimSpace(extra))
-		if extra != "" && extra == host {
-			return true
+	if !strings.EqualFold(u.Scheme, "https") {
+		return urlOrigin{}, fmt.Errorf("refusing to update over %q: binary url must use https", u.Scheme)
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return urlOrigin{}, fmt.Errorf("invalid binary url: missing host")
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return urlOrigin{}, fmt.Errorf("refusing to fetch node binary from port %q", port)
+	}
+	// A trailing slash on both sides is what makes the prefix test a directory
+	// test: without it "/1kst/xpn-evil/" starts with "/1kst/xpn".
+	cleaned := path.Clean("/" + strings.TrimPrefix(u.EscapedPath(), "/"))
+	if !strings.HasSuffix(cleaned, "/") {
+		cleaned += "/"
+	}
+	return urlOrigin{host: host, path: cleaned}, nil
+}
+
+// allowedBinaryOrigins is what this node will accept, the pinned release path
+// plus whatever the operator pinned instead.
+func allowedBinaryOrigins() []urlOrigin {
+	origins := make([]urlOrigin, 0, 2)
+	if o, err := parseBinaryOrigin(NodeReleaseOrigin); err == nil {
+		origins = append(origins, o)
+	}
+	for _, extra := range strings.Split(os.Getenv(allowedBinaryPrefixEnv), ",") {
+		if strings.TrimSpace(extra) == "" {
+			continue
 		}
+		o, err := parseBinaryOrigin(extra)
+		if err != nil {
+			log.Warnf("ignoring unusable %s entry %q: %v", allowedBinaryPrefixEnv, extra, err)
+			continue
+		}
+		origins = append(origins, o)
 	}
-	return false
+	return origins
 }
 
 // validateBinaryURL decides whether a URL handed to us by the panel may be used
 // to replace this node's own executable.
 //
-// The sha256 companion file is fetched from the same origin as the archive, so
-// it can only prove the download was not corrupted in transit — it proves
-// nothing about who produced the binary. There is also no authentication on the
-// heartbeat *response*: the node signs its requests with the shared token, but
-// anything coming back is taken on faith. So the transport and the origin are
-// the only things standing between a hijacked response and root code execution,
-// and both are enforced here rather than merely logged.
+// The sha256 companion file is fetched from the same origin as the archive, so it
+// can only prove the download was not corrupted in transit — it proves nothing
+// about who produced the binary. There is also no authentication on the heartbeat
+// *response*: the node signs its requests with the shared token, but anything
+// coming back is taken on faith. So the transport and the origin are the only
+// things standing between a hijacked response and root code execution, which is
+// why the origin is pinned all the way down to the repository rather than to the
+// host that happens to serve it.
 func validateBinaryURL(raw string) error {
-	u, err := neturl.Parse(strings.TrimSpace(raw))
+	got, err := parseBinaryOrigin(raw)
 	if err != nil {
-		return fmt.Errorf("invalid binary url: %w", err)
+		return err
 	}
-	if !strings.EqualFold(u.Scheme, "https") {
-		return fmt.Errorf("refusing to update over %q: binary url must use https", u.Scheme)
+	for _, want := range allowedBinaryOrigins() {
+		if got.host == want.host && strings.HasPrefix(got.path, want.path) {
+			return nil
+		}
 	}
-	if u.Host == "" {
-		return fmt.Errorf("invalid binary url: missing host")
+	return fmt.Errorf("refusing to fetch node binary from %q: only %s is trusted (set %s to pin somewhere else)",
+		raw, NodeReleaseOrigin, allowedBinaryPrefixEnv)
+}
+
+// binaryDownloadClient follows a release download's redirect to GitHub's asset
+// host and refuses to follow it anywhere else.
+//
+// Without this the origin check applied to the first URL only: the client
+// followed every hop blindly, so an open redirect anywhere under the pinned path
+// would have led the download off it. Every hop must still be https.
+func binaryDownloadClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxBinaryRedirects {
+				return fmt.Errorf("too many redirects fetching node binary (%d)", len(via))
+			}
+			if !strings.EqualFold(req.URL.Scheme, "https") {
+				return fmt.Errorf("refusing redirect to %q: not https", req.URL.Scheme)
+			}
+			host := strings.ToLower(req.URL.Hostname())
+			if host == "github.com" || strings.HasSuffix(host, binaryRedirectSuffix) {
+				return nil
+			}
+			// Named rather than silently allowed: this is the one hop between a
+			// pinned URL and the bytes that replace this executable.
+			return fmt.Errorf("refusing redirect to unapproved host %q while fetching node binary", host)
+		},
 	}
-	if !binaryHostAllowed(u.Host) {
-		return fmt.Errorf("refusing to fetch node binary from unapproved host %q (set %s to allow it)", u.Host, allowedBinaryHostsEnv)
-	}
-	return nil
 }
 
 // panelChannelIsSecure reports whether the control channel itself is protected.
 // A plain-HTTP panel URL means the heartbeat response can be rewritten by anyone
-// on the path, so a "replace your executable" instruction arriving over it
-// cannot be trusted at all — config sync over HTTP is merely an information
-// leak, but honouring a binary swap would be handing over the machine.
+// on the path, so a "replace your executable" instruction arriving over it cannot
+// be trusted at all.
+//
+// Callers only warn on the strength of this, they do not refuse: too many panels
+// are reachable over HTTP only, and refusing would strand them. What makes that
+// survivable is validateBinaryURL pinning the download origin to this project's
+// releases, so the worst a rewritten response achieves is a different release of
+// this project rather than arbitrary code. That is a mitigation, not a fix — the
+// fix is TLS on the panel.
 func panelChannelIsSecure() bool {
 	panelConfigMu.RLock()
 	raw := strings.TrimSpace(panelConfig.PanelURL)
@@ -1549,7 +1648,7 @@ func updateBinaryAndExit(url string) error {
 		return err
 	}
 
-	resp, err := (&http.Client{Timeout: 2 * time.Minute}).Get(url)
+	resp, err := binaryDownloadClient(2 * time.Minute).Get(url)
 	if err != nil {
 		return err
 	}
@@ -1668,7 +1767,7 @@ func updateBinaryAndExit(url string) error {
 
 func fetchExpectedSHA256(binaryURL string) (string, error) {
 	shaURL := binaryURL + ".sha256"
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(shaURL)
+	resp, err := binaryDownloadClient(15 * time.Second).Get(shaURL)
 	if err != nil {
 		return "", err
 	}

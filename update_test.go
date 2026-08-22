@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"net/http"
+	neturl "net/url"
 	"strings"
 	"testing"
 	"time"
@@ -33,29 +35,125 @@ func TestValidateBinaryURL(t *testing.T) {
 		t.Error("an unapproved host must be rejected, not warned about")
 	}
 
-	accepted := []string{
-		"https://github.com/1kst/xpn/releases/download/v1.1.11/xpn-node-linux-amd64.tar.gz",
-		"https://github.com/1kst/xpn/releases/latest/download/xpn-node-linux-amd64.tar.gz",
+	// The pin is the repository, not the host. GitHub lets anyone publish a
+	// release, so a host-only check meant every account on it could supply the
+	// binary this node installs and runs as root.
+	for _, u := range []string{
+		"https://github.com/attacker/evil/releases/download/v1/xpn-node-linux-amd64.tar.gz",
 		"https://objects.github.com/whatever.tar.gz",
+		"https://raw.githubusercontent.com/1kst/xpn/main/x.tar.gz",
+		// Neighbouring paths that a plain string prefix would have accepted.
+		"https://github.com/1kst/xpn-evil/releases/download/v1/x.tar.gz",
+		"https://github.com/1kst/xpnrelease/x.tar.gz",
+		// Traversal back out of the pinned path.
+		"https://github.com/1kst/xpn/releases/../../attacker/evil/releases/download/v1/x.tar.gz",
+		// A look-alike host, and an off-port impostor.
+		"https://github.com.attacker.example/1kst/xpn/releases/download/v1/x.tar.gz",
+		"https://github.com:8443/1kst/xpn/releases/download/v1/x.tar.gz",
+		// Credentials that make the real host look like a path component.
+		"https://github.com@attacker.example/1kst/xpn/releases/download/v1/x.tar.gz",
+		// Plain HTTP, whatever the path.
+		"http://github.com/1kst/xpn/releases/download/v1/x.tar.gz",
+	} {
+		if err := validateBinaryURL(u); err == nil {
+			t.Errorf("validateBinaryURL(%q) = nil, want a refusal", u)
+		}
 	}
-	for _, u := range accepted {
+
+	for _, u := range []string{
+		"https://github.com/1kst/xpn/releases/download/v1.1.11/xpn-node-linux-amd64.tar.gz",
+		"https://github.com/1kst/xpn/releases/latest/download/xpn-node-linux-arm64.tar.gz",
+		// The companion checksum, which is derived by appending to the archive URL.
+		"https://github.com/1kst/xpn/releases/download/v1.1.11/xpn-node-linux-amd64.tar.gz.sha256",
+		// Explicit default port, and mixed case in the scheme and host.
+		"https://GitHub.com:443/1kst/xpn/releases/download/v1/x.tar.gz",
+	} {
 		if err := validateBinaryURL(u); err != nil {
 			t.Errorf("validateBinaryURL(%q) = %v, want nil", u, err)
 		}
 	}
 
-	// A mirror becomes usable only after the operator opts in explicitly.
-	t.Setenv(allowedBinaryHostsEnv, "mirror.example.com, cdn.example.net")
+	// A mirror becomes usable only when the operator pins one, and what they pin
+	// is a whole prefix: a host-only escape hatch would have re-opened the hole
+	// this closes.
+	t.Setenv(allowedBinaryPrefixEnv, "https://mirror.example.com/xpn/builds/")
+	if err := validateBinaryURL("https://mirror.example.com/xpn/builds/v1/xpn-node-linux-amd64.tar.gz"); err != nil {
+		t.Errorf("a pinned mirror path was refused: %v", err)
+	}
 	for _, u := range []string{
-		"https://mirror.example.com/xpn/xpn-node-linux-amd64.tar.gz",
-		"https://CDN.example.net/xpn.tar.gz",
+		// Right host, outside the pinned path.
+		"https://mirror.example.com/elsewhere/x.tar.gz",
+		// Right path, different host.
+		"https://other.example.org/xpn/builds/x.tar.gz",
 	} {
-		if err := validateBinaryURL(u); err != nil {
-			t.Errorf("validateBinaryURL(%q) with allowlist = %v, want nil", u, err)
+		if err := validateBinaryURL(u); err == nil {
+			t.Errorf("validateBinaryURL(%q) = nil, want a refusal even with a mirror pinned", u)
 		}
 	}
-	if err := validateBinaryURL("https://other.example.org/x.tar.gz"); err == nil {
-		t.Error("a host outside the allowlist must still be rejected")
+	// The project's own origin keeps working alongside a pinned mirror.
+	if err := validateBinaryURL("https://github.com/1kst/xpn/releases/download/v1/x.tar.gz"); err != nil {
+		t.Errorf("the built-in origin stopped working once a mirror was pinned: %v", err)
+	}
+}
+
+// TestBinaryRedirectsAreConstrained covers the hop between the pinned URL and the
+// bytes. A GitHub release download redirects to its asset host, and redirects
+// used to be followed with no check at all -- so the origin test applied to the
+// first URL only, and an open redirect under the pinned path would have led the
+// download anywhere.
+func TestBinaryRedirectsAreConstrained(t *testing.T) {
+	client := binaryDownloadClient(5 * time.Second)
+	if client.CheckRedirect == nil {
+		t.Fatal("the download client follows redirects without checking them")
+	}
+
+	req := func(raw string) *http.Request {
+		u, err := neturl.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		return &http.Request{URL: u}
+	}
+
+	// Where GitHub actually sends a release download today, and where it used to.
+	for _, ok := range []string{
+		"https://release-assets.githubusercontent.com/github-production-release-asset/1/2",
+		"https://objects.githubusercontent.com/x",
+		"https://github.com/1kst/xpn/releases/download/v1/x.tar.gz",
+	} {
+		if err := client.CheckRedirect(req(ok), nil); err != nil {
+			t.Errorf("redirect to %q was refused: %v", ok, err)
+		}
+	}
+
+	for _, bad := range []string{
+		"https://attacker.example/payload.tar.gz",
+		"http://objects.githubusercontent.com/x",
+		"https://githubusercontent.com.attacker.example/x",
+	} {
+		if err := client.CheckRedirect(req(bad), nil); err == nil {
+			t.Errorf("redirect to %q was allowed", bad)
+		}
+	}
+
+	// The chain is bounded, so a redirect loop cannot stall an update forever.
+	via := make([]*http.Request, maxBinaryRedirects)
+	if err := client.CheckRedirect(req("https://objects.githubusercontent.com/x"), via); err == nil {
+		t.Error("an over-long redirect chain was allowed")
+	}
+}
+
+// TestConstructedURLsSatisfyOurOwnPin keeps the builders and the validator from
+// drifting apart: a node that built a URL it would then refuse could not update
+// itself at all.
+func TestConstructedURLsSatisfyOurOwnPin(t *testing.T) {
+	for _, u := range []string{DefaultBinaryURL(), binaryURLForVersion("v1.1.17"), binaryURLForVersion("")} {
+		if err := validateBinaryURL(u); err != nil {
+			t.Errorf("this node builds a URL it would refuse: %s -> %v", u, err)
+		}
+		if err := validateBinaryURL(u + ".sha256"); err != nil {
+			t.Errorf("the checksum URL derived from %s would be refused: %v", u, err)
+		}
 	}
 }
 
