@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -291,5 +292,75 @@ func TestFragmentedClientHelloIsParsed(t *testing.T) {
 					len(forwarded), len(framed), firstDiff)
 			}
 		})
+	}
+}
+
+// relayBench pushes a stream through one direction of the relay loop, against
+// io.CopyBuffer as the floor. The relay's per-chunk bookkeeping (clock reads,
+// deadline resets) is what separates the two; on a virtual machine with a slow
+// clock source that bookkeeping, not the copy, was what capped throughput.
+func relayBench(b *testing.B, chunk int, useProxy bool) {
+	sink, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sink.Close()
+	go func() {
+		c, err := sink.Accept()
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, c)
+		c.Close()
+	}()
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer front.Close()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cl, err := front.Accept()
+		if err != nil {
+			return
+		}
+		be, err := net.Dial("tcp", sink.Addr().String())
+		if err != nil {
+			cl.Close()
+			return
+		}
+		if useProxy {
+			done := make(chan struct{}, 1)
+			var ctr atomic.Uint64
+			proxyWithIdleTimeout(be, cl, done, idleTimeout, newSessionActivity(transferTimeout), "c->b", &ctr)
+		} else {
+			buf := make([]byte, 32*1024)
+			io.CopyBuffer(be, cl, buf)
+			be.(*net.TCPConn).CloseWrite()
+		}
+		cl.Close()
+		be.Close()
+	}()
+	c, err := net.Dial("tcp", front.Addr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]byte, chunk)
+	b.SetBytes(int64(chunk))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.Write(buf)
+	}
+	c.(*net.TCPConn).CloseWrite()
+	wg.Wait()
+	c.Close()
+}
+
+func BenchmarkRelay(b *testing.B) {
+	for _, chunk := range []int{512, 32 * 1024} {
+		b.Run(fmt.Sprintf("relay-%d", chunk), func(b *testing.B) { relayBench(b, chunk, true) })
+		b.Run(fmt.Sprintf("iocopy-%d", chunk), func(b *testing.B) { relayBench(b, chunk, false) })
 	}
 }

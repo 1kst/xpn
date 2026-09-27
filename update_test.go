@@ -54,6 +54,14 @@ func TestValidateBinaryURL(t *testing.T) {
 		"https://github.com@attacker.example/1kst/xpn/releases/download/v1/x.tar.gz",
 		// Plain HTTP, whatever the path.
 		"http://github.com/1kst/xpn/releases/download/v1/x.tar.gz",
+		// ".." spelled with escapes, which path.Clean does not fold.
+		"https://github.com/1kst/xpn/releases/%2e%2e/%2e%2e/%2e%2e/evil/repo/raw/main/xpn-node-linux-amd64.tar.gz",
+		// A release older than the floor: it would accept anything on the next beat.
+		"https://github.com/1kst/xpn/releases/download/v1.1.11/xpn-node-linux-amd64.tar.gz",
+		"https://github.com/1kst/xpn/releases/download/v1.1.18/xpn-node-linux-amd64.tar.gz",
+		// Under the pinned path but not a release asset of this project.
+		"https://github.com/1kst/xpn/releases/download/v1.2.0/other.tar.gz",
+		"https://github.com/1kst/xpn/releases/tag/v1.2.0",
 	} {
 		if err := validateBinaryURL(u); err == nil {
 			t.Errorf("validateBinaryURL(%q) = nil, want a refusal", u)
@@ -61,12 +69,13 @@ func TestValidateBinaryURL(t *testing.T) {
 	}
 
 	for _, u := range []string{
-		"https://github.com/1kst/xpn/releases/download/v1.1.11/xpn-node-linux-amd64.tar.gz",
+		"https://github.com/1kst/xpn/releases/download/v1.1.19/xpn-node-linux-amd64.tar.gz",
+		"https://github.com/1kst/xpn/releases/download/v1.2.0/xpn-node-linux-arm64.tar.gz",
 		"https://github.com/1kst/xpn/releases/latest/download/xpn-node-linux-arm64.tar.gz",
 		// The companion checksum, which is derived by appending to the archive URL.
-		"https://github.com/1kst/xpn/releases/download/v1.1.11/xpn-node-linux-amd64.tar.gz.sha256",
+		"https://github.com/1kst/xpn/releases/download/v1.1.19/xpn-node-linux-amd64.tar.gz.sha256",
 		// Explicit default port, and mixed case in the scheme and host.
-		"https://GitHub.com:443/1kst/xpn/releases/download/v1/x.tar.gz",
+		"https://GitHub.com:443/1kst/xpn/releases/download/v1.1.20/xpn-node-linux-amd64.tar.gz",
 	} {
 		if err := validateBinaryURL(u); err != nil {
 			t.Errorf("validateBinaryURL(%q) = %v, want nil", u, err)
@@ -91,7 +100,7 @@ func TestValidateBinaryURL(t *testing.T) {
 		}
 	}
 	// The project's own origin keeps working alongside a pinned mirror.
-	if err := validateBinaryURL("https://github.com/1kst/xpn/releases/download/v1/x.tar.gz"); err != nil {
+	if err := validateBinaryURL("https://github.com/1kst/xpn/releases/download/v1.1.19/xpn-node-linux-amd64.tar.gz"); err != nil {
 		t.Errorf("the built-in origin stopped working once a mirror was pinned: %v", err)
 	}
 }
@@ -130,6 +139,9 @@ func TestBinaryRedirectsAreConstrained(t *testing.T) {
 		"https://attacker.example/payload.tar.gz",
 		"http://objects.githubusercontent.com/x",
 		"https://githubusercontent.com.attacker.example/x",
+		// Hosts under githubusercontent.com that serve what any account uploads.
+		"https://raw.githubusercontent.com/attacker/repo/main/x.tar.gz",
+		"https://gist.githubusercontent.com/attacker/1/raw/x.tar.gz",
 	} {
 		if err := client.CheckRedirect(req(bad), nil); err == nil {
 			t.Errorf("redirect to %q was allowed", bad)
@@ -147,7 +159,7 @@ func TestBinaryRedirectsAreConstrained(t *testing.T) {
 // drifting apart: a node that built a URL it would then refuse could not update
 // itself at all.
 func TestConstructedURLsSatisfyOurOwnPin(t *testing.T) {
-	for _, u := range []string{DefaultBinaryURL(), binaryURLForVersion("v1.1.17"), binaryURLForVersion("")} {
+	for _, u := range []string{DefaultBinaryURL(), binaryURLForVersion(NodeVersion), binaryURLForVersion("")} {
 		if err := validateBinaryURL(u); err != nil {
 			t.Errorf("this node builds a URL it would refuse: %s -> %v", u, err)
 		}
@@ -332,5 +344,34 @@ func TestBinarySizeGuards(t *testing.T) {
 	// downloads without rejecting genuine releases.
 	if minBinaryPayloadSize > 8<<20 {
 		t.Errorf("min payload size %d is high enough to reject real builds", minBinaryPayloadSize)
+	}
+}
+
+// TestReleaseVersionOrder: the floor is compared numerically, so v1.1.100 is
+// newer than v1.1.19 and not older.
+func TestReleaseVersionOrder(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"v1.1.19", "v1.1.19", 0},
+		{"v1.1.18", "v1.1.19", -1},
+		{"v1.1.100", "v1.1.19", 1},
+		{"v2.0.0", "v1.9.9", 1},
+		{"garbage", "v1.1.19", -1},
+	}
+	for _, c := range cases {
+		if got := compareReleaseVersions(c.a, c.b); got != c.want {
+			t.Errorf("compare(%s, %s) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// TestUpdateForRunningVersionIsIgnored: reinstalling the version already running
+// restarts the node, cutting every connection, for nothing.
+func TestUpdateForRunningVersionIsIgnored(t *testing.T) {
+	startBinaryUpdate("", NodeVersion)
+	if binaryUpdateRunning.Load() {
+		t.Error("an update to the running version was started")
 	}
 }

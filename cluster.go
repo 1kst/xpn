@@ -18,10 +18,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -187,6 +190,19 @@ type probeState struct {
 	failCount int
 	nextProbe time.Time
 	lastMS    int
+	// probed is whether lastMS holds a result yet.
+	probed bool
+}
+
+// markProbeFailed records that a user connection could not reach dest, so
+// health_check stops choosing it until the next successful probe.
+func markProbeFailed(dest string) {
+	probeCacheMu.Lock()
+	if state, ok := probeCache[dest]; ok {
+		state.lastMS = -1
+		state.probed = true
+	}
+	probeCacheMu.Unlock()
 }
 
 var (
@@ -377,11 +393,14 @@ func getPublicIP(version int) string {
 		network = "tcp6"
 	}
 
+	// A fresh transport per lookup, so keep-alives are off: with them on, every
+	// lookup left idle connections and their goroutines behind with no timeout.
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, network, addr)
 			},
+			DisableKeepAlives: true,
 		},
 		Timeout: 5 * time.Second,
 	}
@@ -391,7 +410,7 @@ func getPublicIP(version int) string {
 		if err != nil {
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		resp.Body.Close()
 		ipStr := strings.TrimSpace(string(body))
 		if net.ParseIP(ipStr) != nil {
@@ -922,9 +941,12 @@ func heartbeatLoop() {
 	}
 	panelConfigMu.RUnlock()
 
-	go sendHeartbeat()
-
 	go startProbingLoop()
+
+	// The first beat runs here rather than in a goroutine of its own, so it can
+	// never overlap the ticker's: two beats at once could both act on the same
+	// instruction.
+	sendHeartbeat()
 
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
@@ -997,9 +1019,8 @@ func collectSystemMetrics() *SystemMetrics {
 		m.DiskUsed = du.Used
 		m.DiskTotal = du.Total
 	}
-	if io, err := psnet.IOCounters(false); err == nil && len(io) > 0 {
-		m.NetInTransfer = io[0].BytesRecv
-		m.NetOutTransfer = io[0].BytesSent
+	if nics, err := psnet.IOCounters(true); err == nil && len(nics) > 0 {
+		m.NetInTransfer, m.NetOutTransfer = countedNICBytes(nics)
 
 		now := time.Now()
 		metricsMu.Lock()
@@ -1026,6 +1047,48 @@ func collectSystemMetrics() *SystemMetrics {
 	return m
 }
 
+// countedNICBytes totals the interfaces that carry this machine's own traffic to
+// the outside. The previous figure was every interface summed: loopback counted
+// each relay to a local backend twice more, a tunnel's traffic was counted again
+// on the interface carrying it encapsulated, and a bond counted its members and
+// itself. Only loopback, the usual virtual and tunnel devices, and interfaces
+// enslaved to a bond or bridge are left out; anything unrecognised is counted.
+func countedNICBytes(nics []psnet.IOCountersStat) (in, out uint64) {
+	for _, n := range nics {
+		if !countedNIC(n.Name) {
+			continue
+		}
+		in += n.BytesRecv
+		out += n.BytesSent
+	}
+	return in, out
+}
+
+var virtualNICPrefixes = []string{
+	"lo", "docker", "veth", "br-", "virbr", "vnet", "vmnet", "cni", "flannel", "cali",
+	"kube", "cilium", "weave", "tun", "tap", "wg", "tailscale", "zt", "vxlan", "genev",
+	"dummy", "ifb", "sit", "ip6tnl", "gre", "erspan", "teql", "nlmon", "ipsec", "xfrm",
+}
+
+func countedNIC(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, p := range virtualNICPrefixes {
+		if strings.HasPrefix(name, p) {
+			return false
+		}
+	}
+	// On Linux a member of a bond or bridge has a master link; its traffic is
+	// counted on the master.
+	if runtime.GOOS == "linux" {
+		if _, err := os.Lstat("/sys/class/net/" + name + "/master"); err == nil {
+			return false
+		}
+	}
+	return true
+}
+
 func probeTarget(target string) {
 	probeCacheMu.Lock()
 	state, exists := probeCache[target]
@@ -1045,25 +1108,35 @@ func probeTarget(target string) {
 	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	latency := int(time.Since(start).Milliseconds())
 
-	probeCacheMu.Lock()
-	defer probeCacheMu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
 
+	// Logged after the lock is released: health_check reads this cache on every
+	// connection, and a log write that blocks must not stall them.
+	probeCacheMu.Lock()
+	state.probed = true
+	var fails int
 	if err != nil {
 		state.failCount++
 		state.lastMS = -1
-		if conn != nil {
-			conn.Close()
-		}
-		log.Warnf("[Probe] %s failed (%d/3): %v", target, state.failCount, err)
+		fails = state.failCount
 		if state.failCount >= 3 {
 			state.nextProbe = time.Now().Add(30 * time.Second)
-			log.Errorf("[Probe] %s triggered circuit breaker, 30s cooldown", target)
 		}
 	} else {
-		conn.Close()
 		state.failCount = 0
 		state.lastMS = latency
 		state.nextProbe = time.Time{}
+	}
+	probeCacheMu.Unlock()
+
+	if err != nil {
+		log.Warnf("[Probe] %s failed (%d/3): %v", target, fails, err)
+		if fails >= 3 {
+			log.Errorf("[Probe] %s triggered circuit breaker, 30s cooldown", target)
+		}
+	} else {
 		log.Infof("[Probe] %s success: %dms", target, latency)
 	}
 }
@@ -1082,7 +1155,9 @@ func sendHeartbeat() {
 	statusData := make(map[string]int)
 	probeCacheMu.Lock()
 	for target, state := range probeCache {
-		statusData[target] = state.lastMS
+		if state.probed {
+			statusData[target] = state.lastMS
+		}
 	}
 	probeCacheMu.Unlock()
 
@@ -1121,22 +1196,27 @@ func sendHeartbeat() {
 	httpReq.Header.Set("X-XPFW-Key", token)
 	httpReq.Header.Set("Authorization", token)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(httpReq)
+	resp, err := panelClient().Do(httpReq)
 	if err != nil {
-		log.Errorf("send heartbeat failed: %v", err)
+		if n, ok := throttledLog("hb:send"); ok {
+			log.WithFields(throttledFields(map[string]any{"err": err}, n)).Error("send heartbeat failed")
+		}
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Errorf("heartbeat failed with status: %d", resp.StatusCode)
+		if n, ok := throttledLog("hb:status"); ok {
+			log.WithFields(throttledFields(map[string]any{"status": resp.StatusCode}, n)).Error("heartbeat failed")
+		}
 		return
 	}
 
 	var heartbeatResp HeartbeatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&heartbeatResp); err != nil {
-		log.Errorf("decode heartbeat response failed: %v", err)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHeartbeatResponse)).Decode(&heartbeatResp); err != nil {
+		if n, ok := throttledLog("hb:decode"); ok {
+			log.WithFields(throttledFields(map[string]any{"err": err}, n)).Error("decode heartbeat response failed")
+		}
 		return
 	}
 
@@ -1150,27 +1230,73 @@ func sendHeartbeat() {
 		pullConfigFromPanel()
 	}
 	if heartbeatResp.NeedBinaryUpdate {
-		log.Infof("[Heartbeat] binary update requested: local=%s latest=%s", NodeVersion, heartbeatResp.LatestVersion)
-		if !panelChannelIsSecure() {
-			// Not fatal, because plenty of panels are reachable only over HTTP and
-			// blocking updates outright would strand them. What keeps that tolerable
-			// is that validateBinaryURL pins the origin down to this project's
-			// releases: a tampered response can at worst aim this node at another
-			// release of this project. It used to pin only the host, and GitHub lets
-			// anyone publish a release, so at that point the same tampered response
-			// could install anything.
-			log.Warnf("panel url is not https: this update instruction cannot be authenticated. "+
-				"The download origin is pinned to %s, which is the only thing preventing foreign code from "+
-				"being installed; a downgrade to an older release of this project is still possible. Put the panel behind TLS.",
-				NodeReleaseOrigin)
+		startBinaryUpdate(heartbeatResp.BinaryURL, heartbeatResp.LatestVersion)
+	}
+}
+
+// binaryUpdateRunning makes an update a single operation. It used to run inside
+// the heartbeat, which stopped heartbeats for the whole download (long enough
+// for the panel to call the node offline), and two overlapping heartbeats could
+// both be writing xpn-node.new when one of them renamed it into place.
+var binaryUpdateRunning atomic.Bool
+
+func startBinaryUpdate(binaryURL, latest string) {
+	if strings.TrimSpace(latest) != "" && strings.TrimSpace(latest) == NodeVersion {
+		// Already running it: reinstalling would restart the node, cutting every
+		// connection, for nothing. A panel whose idea of the version differs from
+		// the binary's own would otherwise do that on every heartbeat.
+		if n, ok := throttledLog("update:same"); ok {
+			log.WithFields(throttledFields(map[string]any{"version": NodeVersion}, n)).Info("binary update requested for the version already running, ignored")
 		}
-		setNodeUpdateState("running", "binary update started")
-		if err := updateBinaryAndExit(heartbeatResp.BinaryURL); err != nil {
+		return
+	}
+	if !binaryUpdateRunning.CompareAndSwap(false, true) {
+		return
+	}
+	log.Infof("[Heartbeat] binary update requested: local=%s latest=%s", NodeVersion, latest)
+	if !panelChannelIsSecure() {
+		// Not fatal, because plenty of panels are reachable only over HTTP and
+		// blocking updates outright would strand them. What keeps that tolerable
+		// is that validateBinaryURL pins the origin down to this project's
+		// releases: a tampered response can at worst aim this node at another
+		// release of this project. It used to pin only the host, and GitHub lets
+		// anyone publish a release, so at that point the same tampered response
+		// could install anything.
+		log.Warnf("panel url is not https: this update instruction cannot be authenticated. "+
+			"The download origin is pinned to %s releases no older than %s, which is what prevents foreign code "+
+			"from being installed. Put the panel behind TLS.",
+			NodeReleaseOrigin, minSelfUpdateVersion)
+	}
+	setNodeUpdateState("running", "binary update started")
+	go func() {
+		defer binaryUpdateRunning.Store(false)
+		if err := updateBinaryAndExit(binaryURL); err != nil {
 			setNodeUpdateState("failed", fmt.Sprintf("binary update failed: %v", err))
 			log.Errorf("binary update failed: %v", err)
 		}
+	}()
+}
+
+// panelClient is how the node talks to its panel. Redirects are not followed:
+// Go carries the custom token header to wherever a redirect points, including
+// another host and plain http, and a redirected POST arrives as a GET that
+// cannot deliver a heartbeat anyway.
+func panelClient() *http.Client {
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }
+
+// Response bodies from the panel are bounded. They were decoded without a
+// limit, so a wrong or hostile panel could push as much as it liked within the
+// timeout.
+const (
+	maxHeartbeatResponse = 1 << 20
+	maxConfigResponse    = 16 << 20
+)
 
 func pullConfigFromPanel() {
 	panelConfigMu.RLock()
@@ -1189,26 +1315,66 @@ func pullConfigFromPanel() {
 	httpReq.Header.Set("X-XPFW-Key", token)
 	httpReq.Header.Set("Authorization", token)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(httpReq)
+	resp, err := panelClient().Do(httpReq)
 	if err != nil {
-		log.Errorf("pull config failed: %v", err)
+		if n, ok := throttledLog("pull:send"); ok {
+			log.WithFields(throttledFields(map[string]any{"err": err}, n)).Error("pull config failed")
+		}
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Errorf("pull config failed with status: %d", resp.StatusCode)
+		if n, ok := throttledLog("pull:status"); ok {
+			log.WithFields(throttledFields(map[string]any{"status": resp.StatusCode}, n)).Error("pull config failed")
+		}
 		return
 	}
 
-	var configResp ConfigResponse
-	if err := json.NewDecoder(resp.Body).Decode(&configResp); err != nil {
-		log.Errorf("decode config response failed: %v", err)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigResponse+1))
+	if err != nil {
+		log.Errorf("read config response failed: %v", err)
+		return
+	}
+	if len(raw) > maxConfigResponse {
+		log.Errorf("config response exceeds %d bytes, not applied", maxConfigResponse)
+		return
+	}
+	configResp, err := decodeConfigResponse(raw)
+	if err != nil {
+		configVersionMu.Lock()
+		local := configVersionCounter
+		configVersionMu.Unlock()
+		setConfigReject("malformed", 0, local)
+		if n, ok := throttledLog("pull:malformed"); ok {
+			log.WithFields(throttledFields(map[string]any{"err": err}, n)).Error("refusing pulled config: it is not a complete panel config")
+		}
 		return
 	}
 
 	applyConfigFromPanel(configResp)
+}
+
+// decodeConfigResponse refuses a body that is not a config at all. A 200 with
+// {} or an error object in it, which a WAF, a CDN or a misrouted request can
+// produce, decoded to an empty config and was applied: every rule deleted, the
+// default backend blanked, the node dark. A real panel always sends all three
+// fields, even when it has no rules.
+func decodeConfigResponse(raw []byte) (ConfigResponse, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return ConfigResponse{}, fmt.Errorf("not a JSON object: %w", err)
+	}
+	for _, name := range []string{"config", "rules", "config_version"} {
+		if _, ok := fields[name]; !ok {
+			return ConfigResponse{}, fmt.Errorf("missing %q", name)
+		}
+	}
+	var resp ConfigResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return ConfigResponse{}, err
+	}
+	return resp, nil
 }
 
 // rejectPulledConfig decides whether a pulled config must not be applied, and
@@ -1228,7 +1394,7 @@ func rejectPulledConfig(configResp ConfigResponse) string {
 	switch {
 	case configResp.ConfigVersion < local:
 		reason = "older"
-	case len(configResp.Rules) == 0 && !configResp.AllowEmpty && localRuleCount() > 0:
+	case len(configResp.Rules) == 0 && !configResp.AllowEmpty && localRuleCount() != 0:
 		reason = "empty"
 	}
 	if reason == "" {
@@ -1245,10 +1411,12 @@ func rejectPulledConfig(configResp ConfigResponse) string {
 	return reason
 }
 
+// localRuleCount is -1 when it cannot be read, which the empty-config check
+// treats as "has rules": failing to count must not be what lets a node be wiped.
 func localRuleCount() int {
 	var n int
 	if err := db.QueryRow("SELECT COUNT(*) FROM rules").Scan(&n); err != nil {
-		return 0
+		return -1
 	}
 	return n
 }
@@ -1284,6 +1452,11 @@ func applyConfigFromPanel(configResp ConfigResponse) {
 	incoming := configResp.Config
 	incoming.WebPanel = localWebPanel
 	incoming.WebAuth = localWebAuth
+	// An empty listen address is "not specified", not "stop listening": stored,
+	// it left the node with no SNI listener after its next restart.
+	if strings.TrimSpace(incoming.SNIListen) == "" {
+		incoming.SNIListen = oldSNIListen
+	}
 	if strings.TrimSpace(incoming.WebTitle) == "" {
 		incoming.WebTitle = localWebTitle
 	}
@@ -1524,12 +1697,26 @@ const NodeReleaseOrigin = "https://github.com/1kst/xpn/releases/"
 // exactly the hole this closes.
 const allowedBinaryPrefixEnv = "XPN_ALLOWED_BINARY_PREFIX"
 
-// binaryRedirectSuffix is where a GitHub release download is handed off to
-// (currently release-assets.githubusercontent.com; it was objects. before that).
-// Redirects were followed without any check at all, which made the check on the
-// first URL the only one there was — and that host is not on the github.com list
-// the old check used, which is how the gap went unnoticed.
-const binaryRedirectSuffix = ".githubusercontent.com"
+// binaryRedirectHosts is where a GitHub release download is handed off to
+// (release-assets. now, objects. before). Named exactly: any host under
+// githubusercontent.com also covered raw. and gist., which serve whatever any
+// account uploads.
+var binaryRedirectHosts = map[string]bool{
+	"github.com":                           true,
+	"release-assets.githubusercontent.com": true,
+	"objects.githubusercontent.com":        true,
+}
+
+// minSelfUpdateVersion is the oldest release this node will replace itself
+// with. Without a floor the pin above only proved "some release of this
+// project": a tampered heartbeat could install v1.1.11, which checked nothing,
+// and have that install anything on the next beat. This is the first release
+// that refuses to go below it, so a rollback to it cannot open the way further.
+const minSelfUpdateVersion = "v1.1.19"
+
+// releaseAssetPath is the only shape of URL the built-in origin serves a node
+// binary under: a tagged release or latest, and this project's archive name.
+var releaseAssetPath = regexp.MustCompile(`^/1kst/xpn/releases/(?:download/(v[0-9]+\.[0-9]+\.[0-9]+)|latest/download)/xpn-node-linux-[a-z0-9]+\.tar\.gz(?:\.sha256)?$`)
 
 // maxBinaryRedirects bounds the chain. Go's default is 10; a release download
 // takes one hop.
@@ -1605,7 +1792,26 @@ func validateBinaryURL(raw string) error {
 	if err != nil {
 		return err
 	}
+	// Escapes are refused outright. The path is compared in its escaped form, and
+	// path.Clean does not fold %2e%2e, so ".." spelled that way walked out of
+	// the pinned path while passing the prefix test.
+	if strings.Contains(got.path, "%") {
+		return fmt.Errorf("refusing to fetch node binary from %q: encoded characters in the path", raw)
+	}
+	if got.host == "github.com" {
+		m := releaseAssetPath.FindStringSubmatch(strings.TrimSuffix(got.path, "/"))
+		if m != nil {
+			if v := m[1]; v != "" && compareReleaseVersions(v, minSelfUpdateVersion) < 0 {
+				return fmt.Errorf("refusing to install %s: releases older than %s cannot be trusted to refuse a further downgrade", v, minSelfUpdateVersion)
+			}
+			return nil
+		}
+	}
 	for _, want := range allowedBinaryOrigins() {
+		if want.host == "github.com" {
+			// The built-in origin is decided above, by its exact shape.
+			continue
+		}
 		if got.host == want.host && strings.HasPrefix(got.path, want.path) {
 			return nil
 		}
@@ -1631,8 +1837,14 @@ func binaryDownloadClient(timeout time.Duration) *http.Client {
 				return fmt.Errorf("refusing redirect to %q: not https", req.URL.Scheme)
 			}
 			host := strings.ToLower(req.URL.Hostname())
-			if host == "github.com" || strings.HasSuffix(host, binaryRedirectSuffix) {
+			if binaryRedirectHosts[host] {
 				return nil
+			}
+			// A mirror the operator pinned may redirect within its own host.
+			for _, o := range allowedBinaryOrigins() {
+				if o.host != "github.com" && o.host == host {
+					return nil
+				}
 			}
 			// Named rather than silently allowed: this is the one hop between a
 			// pinned URL and the bytes that replace this executable.
@@ -1713,6 +1925,34 @@ func checkExecutableMatchesHost(payload []byte) error {
 			f.Machine, runtime.GOARCH, want)
 	}
 	return nil
+}
+
+// compareReleaseVersions orders vX.Y.Z tags numerically; anything unparsable
+// sorts lowest.
+func compareReleaseVersions(a, b string) int {
+	pa, pb := parseReleaseVersion(a), parseReleaseVersion(b)
+	for i := range pa {
+		if pa[i] != pb[i] {
+			if pa[i] < pb[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func parseReleaseVersion(v string) [3]int {
+	var out [3]int
+	parts := strings.SplitN(strings.TrimPrefix(strings.TrimSpace(v), "v"), ".", 3)
+	for i := range parts {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil || n < 0 {
+			return [3]int{-1, -1, -1}
+		}
+		out[i] = n
+	}
+	return out
 }
 
 func updateBinaryAndExit(url string) error {

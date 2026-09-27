@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -784,5 +786,356 @@ func TestActiveConnCountIsReported(t *testing.T) {
 	}
 	if n := activeConnCount(); n != 0 {
 		t.Errorf("active = %d after both closed, want 0", n)
+	}
+}
+
+// countingBackend accepts connections and counts them, and never reads or
+// writes: a backend that accepted and went silent.
+func countingBackend(t *testing.T) (string, *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		n     atomic.Int64
+		held  []net.Conn
+		heldM = make(chan net.Conn, 64)
+	)
+	t.Cleanup(func() {
+		ln.Close()
+		close(heldM)
+		for c := range heldM {
+			held = append(held, c)
+		}
+		for _, c := range held {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			n.Add(1)
+			select {
+			case heldM <- c:
+			default:
+				c.Close()
+			}
+		}
+	}()
+	return ln.Addr().String(), &n
+}
+
+// TestEmptyConnectionIsNotRelayed: a bare connect that sends nothing used to
+// dial default_backend and relay nothing until the idle timeout.
+func TestEmptyConnectionIsNotRelayed(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+	def, accepted := countingBackend(t)
+	configMu.Lock()
+	globalConfig.DefaultBackend = def
+	configMu.Unlock()
+	proxy := startSNIProxy(t)
+
+	c, err := net.Dial("tcp", proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	time.Sleep(300 * time.Millisecond)
+	if accepted.Load() != 0 {
+		t.Errorf("an empty connection reached default_backend %d time(s)", accepted.Load())
+	}
+
+	// Something that is not TLS but did send bytes still goes there, as before.
+	c, err = net.Dial("tcp", proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+	deadline := time.Now().Add(3 * time.Second)
+	for accepted.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.Close()
+	if accepted.Load() != 1 {
+		t.Errorf("plain bytes reached default_backend %d time(s), want 1", accepted.Load())
+	}
+}
+
+// TestHalfClosedConnectionEndsSoon: when the client closes its side and the
+// backend neither answers nor closes, the connection used to linger for the
+// full idle timeout.
+func TestHalfClosedConnectionEndsSoon(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+	prev := halfCloseIdle
+	halfCloseIdle = 300 * time.Millisecond
+	t.Cleanup(func() { halfCloseIdle = prev })
+
+	silent, _ := countingBackend(t)
+	port := freePort(t)
+	if err := applyRules([]Rule{portRule(1, port, silent)}, 1); err != nil {
+		t.Fatal(err)
+	}
+	var c net.Conn
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var err error
+		c, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c == nil {
+		t.Fatal("port never listened")
+	}
+	defer c.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for activeConnCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if activeConnCount() == 0 {
+		t.Fatal("the connection was never relayed")
+	}
+	c.(*net.TCPConn).CloseWrite()
+	deadline = time.Now().Add(3 * time.Second)
+	for activeConnCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := activeConnCount(); n != 0 {
+		t.Errorf("a half-closed connection to a silent backend is still relayed after 3s (%d active)", n)
+	}
+}
+
+// TestDeadTargetIsSkipped: with several targets, a dead one used to fail its
+// whole share of connections.
+func TestDeadTargetIsSkipped(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+	alive := bannerBackend(t, "alive")
+	port := freePort(t)
+	if err := applyRules([]Rule{portRule(1, port, deadAddr(t), alive)}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, banner := dialPort(t, port); banner != "alive" {
+		t.Errorf("connection went to %q, want the live target", banner)
+	}
+}
+
+// TestHealthCheckIgnoresUnprobedTarget: a target with no probe result yet used
+// to count as 0ms and win outright.
+func TestHealthCheckIgnoresUnprobedTarget(t *testing.T) {
+	probeCacheMu.Lock()
+	prev := probeCache
+	probeCache = map[string]*probeState{
+		"a:1": {lastMS: 40, probed: true},
+		"b:1": {},
+	}
+	probeCacheMu.Unlock()
+	t.Cleanup(func() {
+		probeCacheMu.Lock()
+		probeCache = prev
+		probeCacheMu.Unlock()
+	})
+	if got := selectBackend([]string{"b:1", "a:1"}, LBHealthCheck, nil); got != "a:1" {
+		t.Errorf("health_check chose %q, want the probed target", got)
+	}
+	// A user connection that failed takes the target out until it probes well.
+	markProbeFailed("a:1")
+	probeCacheMu.Lock()
+	failed := probeCache["a:1"].lastMS
+	probeCacheMu.Unlock()
+	if failed != -1 {
+		t.Errorf("after a failed dial lastMS = %d, want -1", failed)
+	}
+}
+
+// TestDNSKeepsLastGoodAnswer: a failed refresh used to throw the working
+// addresses away with it.
+func TestDNSKeepsLastGoodAnswer(t *testing.T) {
+	const host = "stale-test.invalid"
+	dnsCacheMu.Lock()
+	dnsCache[host] = &dnsCacheEntry{ips: []string{"192.0.2.55"}, expiresAt: time.Now().Add(-time.Second)}
+	dnsCacheMu.Unlock()
+	t.Cleanup(func() {
+		dnsCacheMu.Lock()
+		delete(dnsCache, host)
+		dnsCacheMu.Unlock()
+	})
+	ips, err := resolveHostCached(host)
+	if err != nil || len(ips) != 1 || ips[0] != "192.0.2.55" {
+		t.Errorf("after a failed refresh = (%v, %v), want the previous address", ips, err)
+	}
+}
+
+// TestLogThrottleStillThrottlesWhenFull: a full table used to let every new key
+// through unthrottled, forever.
+func TestLogThrottleStillThrottlesWhenFull(t *testing.T) {
+	resetLogThrottle()
+	t.Cleanup(resetLogThrottle)
+	for i := 0; i < logThrottleMaxKeys; i++ {
+		throttledLog(fmt.Sprintf("k%d", i))
+	}
+	emitted := 0
+	for i := 0; i < 50; i++ {
+		if _, ok := throttledLog(fmt.Sprintf("new%d", i)); ok {
+			emitted++
+		}
+	}
+	if emitted > 1 {
+		t.Errorf("%d of 50 new keys were logged with the table full, want at most 1", emitted)
+	}
+}
+
+// TestCountedNICs: loopback, virtual and tunnel devices carry traffic that is
+// counted elsewhere already, or is not traffic to the outside at all.
+func TestCountedNICs(t *testing.T) {
+	for _, name := range []string{"lo", "docker0", "veth12ab", "br-3f", "wg0", "tun0", "tailscale0", "cali1"} {
+		if countedNIC(name) {
+			t.Errorf("%s is counted", name)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		for _, name := range []string{"eth0", "ens3", "enp1s0", "bond0"} {
+			if !countedNIC(name) {
+				t.Errorf("%s is not counted", name)
+			}
+		}
+	}
+}
+
+// TestHandshakeBytesAreCounted: the ClientHello and what came with it are client
+// upload like the rest, and used to go uncounted.
+func TestHandshakeBytesAreCounted(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+	resetTrafficState()
+	a := bannerBackend(t, "A")
+	proxy := startSNIProxy(t)
+	if err := applyRules([]Rule{sniRule(3, "count.example.com", a)}, 1); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := dialSNI(t, proxy, "count.example.com")
+	c.Close()
+	want := uint64(len(fakeClientHello("count.example.com")))
+	if got := counterFor(3).bytesUp.Load(); got < want {
+		t.Errorf("upload counted %d bytes, want at least the %d byte ClientHello", got, want)
+	}
+}
+
+// TestMalformedConfigIsRefused: a 200 with {} or an error object used to decode
+// to an empty config and wipe the node.
+func TestMalformedConfigIsRefused(t *testing.T) {
+	for _, body := range []string{`{}`, `{"code":401,"msg":"login required"}`, `[]`, `<html>`} {
+		if _, err := decodeConfigResponse([]byte(body)); err == nil {
+			t.Errorf("%s was accepted as a config", body)
+		}
+	}
+	good := `{"config":{"sni_listen":":443"},"rules":null,"config_version":0}`
+	if _, err := decodeConfigResponse([]byte(good)); err != nil {
+		t.Errorf("a real (empty) panel config was refused: %v", err)
+	}
+}
+
+// TestMissingListenAddressKeepsTheLocalOne: an empty sni_listen used to be
+// stored and leave the node without an SNI listener after its next restart.
+func TestMissingListenAddressKeepsTheLocalOne(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+	configMu.Lock()
+	globalConfig.SNIListen = ":18443"
+	configMu.Unlock()
+	a := bannerBackend(t, "A")
+	applyConfigFromPanel(ConfigResponse{Config: Config{DefaultBackend: a}, Rules: []Rule{sniRule(1, "a.example.com", a)}, ConfigVersion: 1})
+	configMu.RLock()
+	got := globalConfig.SNIListen
+	configMu.RUnlock()
+	if got != ":18443" {
+		t.Errorf("sni_listen after a config without one = %q, want the local :18443", got)
+	}
+}
+
+// TestListenerMoveKeepsConnections: moving the SNI listener used to cancel the
+// context every relayed SNI connection hung off, closing all of them.
+func TestListenerMoveKeepsConnections(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+	a := bannerBackend(t, "A")
+	if err := applyRules([]Rule{sniRule(1, "move.example.com", a)}, 1); err != nil {
+		t.Fatal(err)
+	}
+	first := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	second := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	t.Cleanup(func() {
+		sniListenerMu.Lock()
+		if sniListenerLn != nil {
+			sniListenerLn.Close()
+		}
+		sniListenerLn, sniListenerAddr = nil, ""
+		sniListenerMu.Unlock()
+		clearSNIListenFailure()
+	})
+
+	restartSNIListener(first)
+	conn, banner := dialSNI(t, first, "move.example.com")
+	if banner != "A" {
+		t.Fatalf("banner = %q", banner)
+	}
+	restartSNIListener(second)
+	if !conn.echoWorks(t) {
+		t.Error("an SNI connection was cut by moving the listener")
+	}
+	if _, banner := dialSNI(t, second, "move.example.com"); banner != "A" {
+		t.Errorf("the new address does not serve: %q", banner)
+	}
+	if _, err := net.DialTimeout("tcp", first, 300*time.Millisecond); err == nil {
+		t.Error("the old address still accepts connections")
+	}
+}
+
+// TestUnbindableListenAddressFallsBackAndIsReported: a bad address stored meant
+// the next restart had nothing to fall back to, and the panel never heard.
+func TestUnbindableListenAddressFallsBackAndIsReported(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+	good := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	taken := blocker.Addr().String()
+	t.Cleanup(func() {
+		sniListenerMu.Lock()
+		if sniListenerLn != nil {
+			sniListenerLn.Close()
+		}
+		sniListenerLn, sniListenerAddr = nil, ""
+		sniListenerMu.Unlock()
+		clearSNIListenFailure()
+	})
+
+	restartSNIListener(good)
+	restartSNIListener(taken)
+
+	sniListenerMu.Lock()
+	serving := sniListenerAddr
+	sniListenerMu.Unlock()
+	if serving != good {
+		t.Errorf("listening on %q, want to have kept %q", serving, good)
+	}
+	var stored string
+	db.QueryRow("SELECT value FROM config WHERE key = 'sni_listen'").Scan(&stored)
+	if stored != good {
+		t.Errorf("stored sni_listen = %q, want the working %q", stored, good)
+	}
+	errs := listenErrors()
+	if len(errs) == 0 || errs[0].RuleID != 0 || !strings.Contains(errs[0].Error, "SNI") {
+		t.Errorf("listen errors = %+v, want the SNI failure reported", errs)
 	}
 }

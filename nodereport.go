@@ -2,7 +2,10 @@ package xpfw
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +49,31 @@ func clearListenFailure(port int) {
 	listenFailMu.Unlock()
 }
 
+// sniListenFail is the SNI listener's failure, reported like a port rule's
+// with rule id 0. Kept apart from listenFails because desiredPorts, which
+// prunes that table, knows only port rules.
+var sniListenFail *ListenError
+
+func setSNIListenFailure(addr string, err error) {
+	port := 0
+	if _, p, splitErr := net.SplitHostPort(addr); splitErr == nil {
+		port, _ = strconv.Atoi(p)
+	}
+	listenFailMu.Lock()
+	defer listenFailMu.Unlock()
+	since := time.Now().Format(time.RFC3339)
+	if sniListenFail != nil && sniListenFail.Port == port {
+		since = sniListenFail.Since
+	}
+	sniListenFail = &ListenError{Port: port, Error: fmt.Sprintf("SNI listen %s: %v", addr, err), Since: since}
+}
+
+func clearSNIListenFailure() {
+	listenFailMu.Lock()
+	sniListenFail = nil
+	listenFailMu.Unlock()
+}
+
 // listenErrors reports the failures for ports the configuration still wants. A
 // port dropped from the configuration while failing is no longer an error.
 func listenErrors() []ListenError {
@@ -67,6 +95,9 @@ func listenErrors() []ListenError {
 		out = append(out, ListenError{Port: port, RuleID: f.ruleID, Error: f.err, Since: f.since.Format(time.RFC3339)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Port < out[j].Port })
+	if sniListenFail != nil {
+		out = append([]ListenError{*sniListenFail}, out...)
+	}
 	return out
 }
 

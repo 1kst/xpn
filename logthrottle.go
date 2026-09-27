@@ -44,6 +44,9 @@ type logThrottleState struct {
 var (
 	logThrottleMu   sync.Mutex
 	logThrottleKeys = make(map[string]*logThrottleState)
+	// logThrottleOverflow is shared by new keys while the table is full, and is
+	// kept out of it so the bound holds.
+	logThrottleOverflow logThrottleState
 
 	// Counters for how much logging this process has actually done, reported to
 	// the panel so an operator can see which node is noisy without shelling into
@@ -68,12 +71,21 @@ func throttledLog(key string) (suppressed uint64, ok bool) {
 	st := logThrottleKeys[key]
 	if st == nil {
 		if len(logThrottleKeys) >= logThrottleMaxKeys {
-			// Full. Log rather than silently drop: an unbounded key space is a bug
-			// to be found, and losing the message would hide it.
-			logThrottleMu.Unlock()
-			logLinesEmitted.Add(1)
-			return 0, true
+			// Full. Forget keys whose window closed long ago; their pending count
+			// is at most one interval of a situation that has ended. If that frees
+			// nothing, new keys share one overflow key: being full used to let
+			// every new key through unthrottled, forever.
+			for k, old := range logThrottleKeys {
+				if now.Sub(old.last) >= 2*logThrottleInterval {
+					delete(logThrottleKeys, k)
+				}
+			}
+			if len(logThrottleKeys) >= logThrottleMaxKeys {
+				st = &logThrottleOverflow
+			}
 		}
+	}
+	if st == nil {
 		st = &logThrottleState{last: now}
 		logThrottleKeys[key] = st
 		logThrottleMu.Unlock()
@@ -116,6 +128,7 @@ func logCounters() (emitted, suppressed uint64) {
 func resetLogThrottle() {
 	logThrottleMu.Lock()
 	logThrottleKeys = make(map[string]*logThrottleState)
+	logThrottleOverflow = logThrottleState{}
 	logThrottleMu.Unlock()
 	logLinesEmitted.Store(0)
 	logLinesSuppressed.Store(0)

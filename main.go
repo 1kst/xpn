@@ -35,9 +35,12 @@ const (
 	backendDialTimeout = 6 * time.Second
 	idleTimeout        = 3 * time.Minute
 	transferTimeout    = 2 * time.Hour
-	dnsCacheTTL        = 60 * time.Second
-	dnsNegativeTTL     = 5 * time.Second
-	dnsLookupTimeout   = 2 * time.Second
+	// dnsStaleTTL is how long a name keeps its last good addresses when a refresh
+	// fails, before the next attempt.
+	dnsStaleTTL      = 30 * time.Second
+	dnsCacheTTL      = 60 * time.Second
+	dnsNegativeTTL   = 5 * time.Second
+	dnsLookupTimeout = 2 * time.Second
 )
 
 // DefaultBinaryURL is the fallback download for this node's own architecture.
@@ -284,7 +287,6 @@ var (
 	desiredPorts  = make(map[int]*sniRouteEntry)
 	sniRouteCache = make(map[string]*sniRouteEntry)
 	sniRouteMu    sync.RWMutex
-	sniRouteLogN  uint64
 	dnsCache      = make(map[string]*dnsCacheEntry)
 	dnsCacheMu    sync.Mutex
 
@@ -591,7 +593,10 @@ func savePanelConfigToDB() error {
 }
 
 func initDB(dbPath string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_busy_timeout=5000", dbPath)
+	// busy_timeout as a pragma: this driver ignores a bare _busy_timeout=, so the
+	// timeout was never applied and a write contended by a backup or the sqlite3
+	// shell failed at once.
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbPath)
 	database, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -658,6 +663,11 @@ func initDB(dbPath string) (*sql.DB, error) {
 
 	if _, err := database.Exec(schema); err != nil {
 		return nil, err
+	}
+	// The database holds the panel token; it has no business being readable by
+	// every account on the machine.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Chmod(dbPath+suffix, 0o600)
 	}
 
 	database.Exec("ALTER TABLE rules ADD COLUMN version INTEGER DEFAULT 0")
@@ -784,6 +794,16 @@ func setLogLevel(lvl string) {
 // then fail to bind or immediately shut down again, leaving nothing listening.
 var sniRestartMu sync.Mutex
 
+// restartSNIListener moves the SNI listener to addr.
+//
+// The new address is bound while the old listener still serves, so moving to
+// another port has no gap and a bad address costs nothing; only when the old
+// listener holds the very port needed is it released first. Connections already
+// relayed are left alone: only the listener moves, where it used to take every
+// SNI connection on the node down with it. If the new address cannot be bound
+// the node keeps, or goes back to, the previous one, and that address is what
+// gets stored: the bad one stored meant the next restart had nothing to fall
+// back to. Either way the failure is reported to the panel.
 func restartSNIListener(addr string) {
 	if addr != "" && !strings.Contains(addr, ":") {
 		addr = ":" + addr
@@ -794,59 +814,81 @@ func restartSNIListener(addr string) {
 
 	sniListenerMu.Lock()
 	previousAddr := sniListenerAddr
-	if sniListenerLn != nil {
-		sniListenerLn.Close()
-		sniListenerLn = nil
-	}
-	if sniListenerCancel != nil {
-		sniListenerCancel()
-	}
-	sniCtx, cancel := context.WithCancel(mainCtx)
-	sniListenerCancel = cancel
-	sniListenerAddr = addr
+	oldLn := sniListenerLn
 	sniListenerMu.Unlock()
 
-	// Give the old listener a moment to release the port before rebinding.
-	time.Sleep(200 * time.Millisecond)
-
-	if bindSNIListener(sniCtx, addr) {
-		return
+	parent := mainCtx
+	if parent == nil {
+		parent = context.Background()
 	}
 
-	// The new address is unusable. Falling back to the previous one keeps this
-	// node forwarding traffic instead of going dark until someone changes the
-	// configuration again — on a node, no listener means a full outage.
-	if previousAddr != "" && previousAddr != addr {
-		log.Warnf("SNI listen %s failed, falling back to previous address %s", addr, previousAddr)
-		sniListenerMu.Lock()
-		sniListenerAddr = previousAddr
-		sniListenerMu.Unlock()
-		if bindSNIListener(sniCtx, previousAddr) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil && oldLn != nil && samePort(addr, previousAddr) {
+		// The old listener is what holds the port. Release it and try again.
+		oldLn.Close()
+		oldLn = nil
+		ln, err = listenWithRetry(addr)
+	}
+	if err != nil {
+		setSNIListenFailure(addr, err)
+		if previousAddr == "" || previousAddr == addr {
+			log.Errorf("SNI listener is down: %s could not be bound: %v", addr, err)
 			return
 		}
+		if oldLn != nil {
+			// Still serving on the previous address; nothing moved.
+			log.Warnf("SNI listen %s failed (%v), still listening on %s", addr, err, previousAddr)
+			persistSNIListen(previousAddr)
+			return
+		}
+		log.Warnf("SNI listen %s failed (%v), going back to %s", addr, err, previousAddr)
+		ln, err = listenWithRetry(previousAddr)
+		if err != nil {
+			log.Errorf("SNI listener is down: neither %s nor %s could be bound", addr, previousAddr)
+			return
+		}
+		addr = previousAddr
+		persistSNIListen(addr)
+	} else {
+		clearSNIListenFailure()
 	}
-	log.Errorf("SNI listener is down: neither %s nor %s could be bound", addr, previousAddr)
+
+	ctx, cancel := context.WithCancel(parent)
+	sniListenerMu.Lock()
+	// The previous context is deliberately not cancelled: that is what closes the
+	// connections the old listener accepted. It is a child of mainCtx and goes
+	// with it at shutdown.
+	sniListenerCancel = cancel
+	sniListenerAddr = addr
+	// Recorded here, not only by the accept loop once it starts: a restart that
+	// follows quickly must see this listener, or it takes the address for free
+	// and fails to bind it.
+	sniListenerLn = ln
+	sniListenerMu.Unlock()
+	if oldLn != nil {
+		oldLn.Close()
+	}
+	go serveSNIListener(ctx, addr, ln)
 }
 
-// bindSNIListener tries to bind addr, retrying briefly because the previous
-// listener's socket may still be in TIME_WAIT or a peer process may be exiting.
-// It reports whether the accept loop was handed a live listener.
-func bindSNIListener(ctx context.Context, addr string) bool {
+func samePort(a, b string) bool {
+	_, pa, errA := net.SplitHostPort(a)
+	_, pb, errB := net.SplitHostPort(b)
+	return errA == nil && errB == nil && pa == pb
+}
+
+// listenWithRetry binds addr, retrying briefly for a socket that is still being
+// released.
+func listenWithRetry(addr string) (net.Listener, error) {
 	const attempts = 5
 	delay := 200 * time.Millisecond
+	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-
 		ln, err := net.Listen("tcp", addr)
 		if err == nil {
-			go serveSNIListener(ctx, addr, ln)
-			return true
+			return ln, nil
 		}
-		log.Errorf("SNI listen %s (attempt %d/%d): %v", addr, attempt, attempts, err)
+		lastErr = err
 		if attempt < attempts {
 			time.Sleep(delay)
 			if delay < 2*time.Second {
@@ -854,7 +896,20 @@ func bindSNIListener(ctx context.Context, addr string) bool {
 			}
 		}
 	}
-	return false
+	return nil, lastErr
+}
+
+// persistSNIListen records the address actually in use, so a restart binds what
+// works rather than what failed.
+func persistSNIListen(addr string) {
+	configMu.Lock()
+	globalConfig.SNIListen = addr
+	configMu.Unlock()
+	if db != nil {
+		if _, err := db.Exec("UPDATE config SET value = ? WHERE key = 'sni_listen'", addr); err != nil {
+			log.Errorf("store SNI listen address %s failed: %v", addr, err)
+		}
+	}
 }
 
 func startSNIListener(ctx context.Context, addr string) {
@@ -942,12 +997,26 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	// the lifetime of the connection.
 	br := handshakeReaderPool.Get().(*bufio.Reader)
 	br.Reset(client)
-	defer func() {
-		br.Reset(nil)
-		handshakeReaderPool.Put(br)
-	}()
+	// Returned to the pool as soon as the handshake bytes are handed on, not when
+	// the connection ends: held for the whole relay it made every live connection
+	// pin 20 KiB it no longer used.
+	releaseReader := func() {
+		if br != nil {
+			br.Reset(nil)
+			handshakeReaderPool.Put(br)
+			br = nil
+		}
+	}
+	defer releaseReader()
 
 	sni, peeked, err := peekClientHelloSNI(br)
+	if err != nil && len(peeked) == 0 && br.Buffered() == 0 {
+		// Nothing arrived at all: a port probe, a bare connect, a health check.
+		// Dialling default_backend for it used to cost a backend connection and up
+		// to the idle timeout of relaying nothing, per probe.
+		noteSNIMiss(sni, err)
+		return
+	}
 	if err != nil {
 		// The highest-volume line on the node: every port probe and every browser
 		// preconnect that opens a connection without sending a ClientHello lands
@@ -983,7 +1052,7 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	}
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		log.WithFields(fields).Debug("SNI route")
-	} else if atomic.AddUint64(&sniRouteLogN, 1)%200 == 0 {
+	} else if routeSampleDue() {
 		log.WithFields(fields).Info("SNI route sample")
 	}
 	// A miss that carried a hostname is logged in full, unsampled: it means a
@@ -1039,35 +1108,77 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	_ = client.SetDeadline(time.Time{})
 	_ = backendConn.SetDeadline(time.Time{})
 
-	if len(peeked) > 0 {
-		backendConn.Write(peeked)
-	}
-	if n := br.Buffered(); n > 0 {
-		buf := make([]byte, n)
-		io.ReadFull(br, buf)
-		backendConn.Write(buf)
-	}
-
-	activity := newSessionActivity(transferTimeout)
-	done := make(chan struct{}, 2)
 	// c->b is what the client uploads, b->c what it downloads. Kept apart because
 	// egress is usually the side that gets billed.
 	var up, down *atomic.Uint64
 	if counters != nil {
 		up, down = &counters.bytesUp, &counters.bytesDown
 	}
+
+	// The handshake and anything that arrived with it go first. They are client
+	// upload like the rest and are counted as such; they used to be written
+	// uncounted and with the error ignored.
+	first := peeked
+	if n := br.Buffered(); n > 0 {
+		rest := make([]byte, n)
+		io.ReadFull(br, rest)
+		first = append(first, rest...)
+	}
+	releaseReader()
+	if len(first) > 0 {
+		_ = backendConn.SetWriteDeadline(time.Now().Add(idleTimeout))
+		n, werr := backendConn.Write(first)
+		bytesTo(up, n)
+		if werr != nil {
+			return
+		}
+	}
+
+	relayPair(client, backendConn, up, down, ctx)
+}
+
+// relayPair relays both directions of one connection until both are done, or
+// ctx ends. When one direction finishes first, the other is put on the shorter
+// halfCloseIdle limit and woken so it applies it at once.
+func relayPair(client, backendConn net.Conn, up, down *atomic.Uint64, ctx context.Context) {
+	activity := newSessionActivity(transferTimeout)
+	done := make(chan struct{}, 2)
 	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b", up)
 	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c", down)
 
 	select {
 	case <-done:
-		<-done
+		activity.halfClosed.Store(true)
+		wake := time.Now().Add(halfCloseIdle)
+		_ = client.SetReadDeadline(wake)
+		_ = backendConn.SetReadDeadline(wake)
+		select {
+		case <-done:
+		case <-ctx.Done():
+			client.Close()
+			backendConn.Close()
+			<-done
+		}
 	case <-ctx.Done():
 		client.Close()
 		backendConn.Close()
 		<-done
 		<-done
 	}
+}
+
+// routeSampleAt is when the last routing sample was logged. Sampling by time
+// rather than by count: one in 200 connections was 25 lines a second at 5,000
+// connections a second, the flood the throttle elsewhere exists to prevent.
+var routeSampleAt atomic.Int64
+
+func routeSampleDue() bool {
+	now := time.Now().UnixNano()
+	last := routeSampleAt.Load()
+	if now-last < int64(logThrottleInterval) {
+		return false
+	}
+	return routeSampleAt.CompareAndSwap(last, now)
 }
 
 // lookupSNIRoute returns the route for a hostname and whether anything matched.
@@ -1099,10 +1210,28 @@ func dialPicked(entry *sniRouteEntry, backend string, viaFallback bool) (net.Con
 	}
 	conn, err := dialBackendWithDNSCache("tcp", backend, timeout)
 	if !onPinned {
-		return conn, backend, viaFallback, err
+		if err == nil || entry == nil || viaFallback || len(entry.dests) < 2 {
+			return conn, backend, viaFallback, err
+		}
+		// One more target before giving up: with several targets a dead one used
+		// to fail its whole share of connections until something noticed, and
+		// health_check kept choosing it for up to a probe interval.
+		markProbeFailed(backend)
+		alt := alternativeDest(entry.dests, backend)
+		if alt == "" {
+			return conn, backend, viaFallback, err
+		}
+		noteDialResult(backend, false)
+		if n, ok := throttledLog("retry:" + backend); ok {
+			log.WithFields(throttledFields(logrus.Fields{"backend": backend, "retry": alt, "err": err}, n)).Warn("backend unreachable, trying another target of the rule")
+		}
+		conn, err = dialBackendWithDNSCache("tcp", alt, backendDialTimeout)
+		return conn, alt, false, err
 	}
 	if err == nil {
-		failoverObserve(backend, nil)
+		// Only probes move a landing between up and down, in both directions: a
+		// landing that fails half its connections must still be caught by the
+		// probes, which user successes resetting the count would prevent.
 		return conn, backend, false, nil
 	}
 	noteDialResult(backend, false)
@@ -1113,6 +1242,21 @@ func dialPicked(entry *sniRouteEntry, backend string, viaFallback bool) (net.Con
 	}
 	conn, err = dialBackendWithDNSCache("tcp", fallback, backendDialTimeout)
 	return conn, fallback, true, err
+}
+
+// alternativeDest is the target after failed in dests, wrapping round.
+func alternativeDest(dests []string, failed string) string {
+	for i, d := range dests {
+		if d == failed {
+			for j := 1; j < len(dests); j++ {
+				if alt := dests[(i+j)%len(dests)]; alt != failed {
+					return alt
+				}
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 // noteSNIMiss books a connection that reached no rule against the reason it did
@@ -1211,6 +1355,20 @@ func resolveHostCached(host string) ([]string, error) {
 	ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		dnsCacheMu.Lock()
+		if old, ok := dnsCache[host]; ok && !old.negative && len(old.ips) > 0 {
+			// Serve the last good answer rather than none: a resolver hiccup at
+			// the moment the entry expired used to fail every connection to the
+			// name, and failover probes with it, which could mark a pinned
+			// landing down that had never stopped answering.
+			old.expiresAt = time.Now().Add(dnsStaleTTL)
+			ordered := rotateIPs(old.ips, old.nextIdx)
+			old.nextIdx = (old.nextIdx + 1) % len(old.ips)
+			dnsCacheMu.Unlock()
+			if n, ok := throttledLog("dnsstale:" + host); ok {
+				log.WithFields(throttledFields(logrus.Fields{"host": host, "err": err}, n)).Warn("dns refresh failed, still using the previous addresses")
+			}
+			return ordered, nil
+		}
 		dnsCache[host] = &dnsCacheEntry{negative: true, expiresAt: time.Now().Add(dnsNegativeTTL)}
 		dnsCacheMu.Unlock()
 		return nil, err
@@ -1595,24 +1753,11 @@ func handlePortForward(client net.Conn, port int, route *sniRouteEntry, ctx cont
 		"backend": backend,
 	}).Debug("port forward")
 
-	activity := newSessionActivity(transferTimeout)
-	done := make(chan struct{}, 2)
 	var up, down *atomic.Uint64
 	if counters != nil {
 		up, down = &counters.bytesUp, &counters.bytesDown
 	}
-	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b", up)
-	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c", down)
-
-	select {
-	case <-done:
-		<-done
-	case <-ctx.Done():
-		client.Close()
-		backendConn.Close()
-		<-done
-		<-done
-	}
+	relayPair(client, backendConn, up, down, ctx)
 }
 
 func selectBackend(dests []string, strategy string, counter *uint64) string {
@@ -1640,7 +1785,9 @@ func selectBackend(dests []string, strategy string, counter *uint64) string {
 		bestMS := -1
 		for _, dest := range dests {
 			state, ok := probeCache[dest]
-			if ok && state.lastMS >= 0 {
+			// A target not probed yet has no latency, not a latency of zero; it
+			// used to win outright until its first probe finished.
+			if ok && state.probed && state.lastMS >= 0 {
 				if best == "" || state.lastMS < bestMS {
 					best = dest
 					bestMS = state.lastMS
@@ -1680,25 +1827,43 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+// halfCloseIdle is the idle limit once one direction has finished. A peer that
+// closed its side and a backend that accepted and then went silent used to hold
+// both sockets for the full idleTimeout; the direction still open is given this
+// much silence instead. A transfer still moving is not cut. A variable only so
+// tests need not wait half a minute.
+var halfCloseIdle = 30 * time.Second
+
 // sessionActivity is shared by both directions of one proxied connection so the
 // idle timer reflects the connection as a whole.
 type sessionActivity struct {
 	lastActive atomic.Int64 // unix nanoseconds
 	deadline   time.Time    // absolute cap for the whole session
+	// halfClosed is set once one direction has finished; the other then goes by
+	// halfCloseIdle instead of the full idle timeout.
+	halfClosed atomic.Bool
 }
 
 func newSessionActivity(total time.Duration) *sessionActivity {
-	s := &sessionActivity{deadline: time.Now().Add(total)}
-	s.touch()
+	now := time.Now()
+	s := &sessionActivity{deadline: now.Add(total)}
+	s.touchAt(now)
 	return s
 }
 
-func (s *sessionActivity) touch() {
-	s.lastActive.Store(time.Now().UnixNano())
+func (s *sessionActivity) touchAt(now time.Time) {
+	s.lastActive.Store(now.UnixNano())
 }
 
-func (s *sessionActivity) idleFor() time.Duration {
-	return time.Since(time.Unix(0, s.lastActive.Load()))
+func (s *sessionActivity) last() time.Time {
+	return time.Unix(0, s.lastActive.Load())
+}
+
+func (s *sessionActivity) idleLimit(timeout time.Duration) time.Duration {
+	if s.halfClosed.Load() && halfCloseIdle < timeout {
+		return halfCloseIdle
+	}
+	return timeout
 }
 
 // proxyWithIdleTimeout relays src into dst until the connection as a whole goes
@@ -1709,11 +1874,14 @@ func (s *sessionActivity) idleFor() time.Duration {
 // minutes — looked idle from the client side, and the resulting CloseWrite sent
 // the backend an EOF that aborted the transfer mid-flight.
 //
-// The read deadline is a short polling tick rather than the full idle timeout so
-// that the shared timestamp and the absolute deadline are re-checked regularly.
-// That absolute deadline is what makes transferTimeout real: previously every
-// read reset the connection deadline set by the caller, so the intended 2 hour
-// cap could never fire.
+// The read deadline is the moment the connection would go idle, not a fixed
+// tick: an idle connection wakes once per idle period, where a five second tick
+// woke every idle connection twelve times a minute for nothing. A direction
+// woken early because the other one was busy finds the shared timestamp moved on
+// and sleeps again. Deadlines are only moved when they would change by more than
+// a second, and the clock is read twice per chunk; resetting both deadlines and
+// reading the clock five times per chunk used to cost more than the copy on
+// virtual machines with a slow clock source.
 // bytesTo accumulates relayed payload into a counter when one is supplied. A nil
 // counter means the connection could not be attributed to a rule (an SNI miss
 // routed to default_backend), and the bytes are simply not attributed.
@@ -1735,44 +1903,58 @@ func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.
 	defer copyBufPool.Put(bufPtr)
 	buf := *bufPtr
 
-	const pollInterval = 5 * time.Second
-
+	var readDL, writeDL time.Time
+	now := time.Now()
 	for {
-		now := time.Now()
-		if !activity.deadline.IsZero() && now.After(activity.deadline) {
+		if !activity.deadline.IsZero() && !now.Before(activity.deadline) {
 			log.Debugf("proxy %s closed: exceeded total transfer timeout", direction)
 			return
 		}
-		if activity.idleFor() >= timeout {
-			log.Debugf("proxy %s closed: idle for %v", direction, activity.idleFor())
+		last := activity.last()
+		limit := activity.idleLimit(timeout)
+		if now.Sub(last) >= limit {
+			log.Debugf("proxy %s closed: idle for %v", direction, now.Sub(last))
 			return
 		}
 
-		wake := now.Add(pollInterval)
+		wake := last.Add(limit)
 		if !activity.deadline.IsZero() && activity.deadline.Before(wake) {
 			wake = activity.deadline
 		}
-		_ = src.SetReadDeadline(wake)
+		if readDL.IsZero() || wake.Before(readDL) || wake.Sub(readDL) > time.Second {
+			readDL = wake
+			_ = src.SetReadDeadline(wake)
+		}
 
 		n, err := src.Read(buf)
+		now = time.Now()
 		if n > 0 {
-			activity.touch()
-			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				// Counted on the read: the bytes did cross this node even if the
-				// far side went away before they could be handed on.
-				bytesTo(relayed, n)
+			activity.touchAt(now)
+			if wd := now.Add(timeout); wd.Sub(writeDL) > time.Second {
+				writeDL = wd
+				_ = dst.SetWriteDeadline(wd)
+			}
+			_, werr := dst.Write(buf[:n])
+			// Counted on the read: the bytes did cross this node even if the far
+			// side went away before they could be handed on.
+			bytesTo(relayed, n)
+			if werr != nil {
 				return
 			}
-			bytesTo(relayed, n)
-			activity.touch()
+			// A write can block for a long time on a slow receiver; that is
+			// activity too.
+			now = time.Now()
+			activity.touchAt(now)
 		}
 
 		if err != nil {
-			// A read deadline hit is just our polling tick: loop round and let
-			// the checks above decide whether the connection is really done.
+			// A read deadline hit means "check again": loop round and let the
+			// checks above decide whether the connection is really done. The
+			// deadline this goroutine last set may have been replaced from outside
+			// (see relayPair), so it is recomputed rather than trusted.
 			var nerr net.Error
 			if errors.As(err, &nerr) && nerr.Timeout() {
+				readDL = time.Time{}
 				continue
 			}
 			return
