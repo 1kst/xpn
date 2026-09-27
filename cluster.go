@@ -99,6 +99,11 @@ type HeartbeatRequest struct {
 	UpdateMessage string         `json:"update_message,omitempty"`
 	UpdateAt      string         `json:"update_at,omitempty"`
 	Traffic       *NodeCounters  `json:"traffic,omitempty"`
+	// Failover carries the pinned landings that are down right now and the
+	// transitions the panel has not acknowledged yet.
+	Failover     *FailoverReport `json:"failover,omitempty"`
+	ListenErrors []ListenError   `json:"listen_errors,omitempty"`
+	ConfigReject *ConfigReject   `json:"config_reject,omitempty"`
 }
 
 // NodeCounters carries the node's own accounting of proxied traffic. The panel's
@@ -400,12 +405,23 @@ type HeartbeatResponse struct {
 	NeedBinaryUpdate bool   `json:"need_binary_update"`
 	LatestVersion    string `json:"latest_version"`
 	BinaryURL        string `json:"binary_url"`
+	// FailoverAck is the highest failover event seq the panel has processed.
+	FailoverAck uint64 `json:"failover_ack,omitempty"`
 }
 
 type ConfigResponse struct {
 	Config        Config `json:"config"`
 	Rules         []Rule `json:"rules"`
 	ConfigVersion int    `json:"config_version"`
+	// Guarded is the panel saying it understands the two refusals below and can
+	// resolve them: it sends AllowEmpty when an empty list is deliberate, and it
+	// can resync a fleet that is ahead of it. A panel that does not say so, an
+	// older release or the panel built into this binary, gets the behaviour it
+	// always had, because it would have no way to undo a refusal.
+	Guarded bool `json:"guarded,omitempty"`
+	// AllowEmpty is the panel saying an empty rule list is deliberate. Without it
+	// a node that has rules refuses a config that has none.
+	AllowEmpty bool `json:"allow_empty,omitempty"`
 }
 
 var (
@@ -937,7 +953,12 @@ func runProbing() {
 		if !rule.Enabled {
 			continue
 		}
-		for _, dest := range rule.Dest {
+		// The fallback is probed too, so the panel can show the latency of where
+		// a pinned entry would fail over to.
+		for _, dest := range append(append([]string(nil), rule.Dest...), rule.Fallback...) {
+			if _, seen := active[dest]; seen {
+				continue
+			}
 			active[dest] = struct{}{}
 			go probeTarget(dest)
 		}
@@ -1072,6 +1093,9 @@ func sendHeartbeat() {
 		StatusData:    statusData,
 		System:        collectSystemMetrics(),
 		Traffic:       collectTrafficCounters(),
+		Failover:      failoverReport(),
+		ListenErrors:  listenErrors(),
+		ConfigReject:  currentConfigReject(),
 	}
 	reportedStatus, message, at := getNodeUpdateState()
 	if reportedStatus != "" {
@@ -1115,6 +1139,7 @@ func sendHeartbeat() {
 	// The panel has the result now, so the terminal state can be retired. Doing
 	// this any earlier loses the outcome whenever the POST itself fails.
 	clearNodeUpdateState(reportedStatus)
+	ackFailoverEvents(heartbeatResp.FailoverAck)
 
 	if heartbeatResp.NeedUpdate {
 		log.Infof("[Heartbeat] remote version %d is newer than local %d, pulling update...", heartbeatResp.ConfigVersion, currentVersion)
@@ -1182,7 +1207,63 @@ func pullConfigFromPanel() {
 	applyConfigFromPanel(configResp)
 }
 
+// rejectPulledConfig decides whether a pulled config must not be applied, and
+// records why so the heartbeat can tell the panel. It exists because applying a
+// config replaces every local rule, and a node pulls unconditionally whenever it
+// starts: a panel that came back from a reinstall or an old backup would
+// otherwise wipe or roll back each node the next time that node restarted.
+func rejectPulledConfig(configResp ConfigResponse) string {
+	if !configResp.Guarded {
+		return ""
+	}
+	configVersionMu.Lock()
+	local := configVersionCounter
+	configVersionMu.Unlock()
+
+	reason := ""
+	switch {
+	case configResp.ConfigVersion < local:
+		reason = "older"
+	case len(configResp.Rules) == 0 && !configResp.AllowEmpty && localRuleCount() > 0:
+		reason = "empty"
+	}
+	if reason == "" {
+		return ""
+	}
+	setConfigReject(reason, configResp.ConfigVersion, local)
+	if n, ok := throttledLog("cfgreject:" + reason); ok {
+		msg := "refusing pulled config: its version is older than the one running here; if the panel was restored on purpose, use its resync action"
+		if reason == "empty" {
+			msg = "refusing pulled config: it has no rules while this node has some; if that is intended, confirm it on the panel"
+		}
+		log.WithFields(throttledFields(map[string]any{"panel_version": configResp.ConfigVersion, "local_version": local, "local_rules": localRuleCount()}, n)).Error(msg)
+	}
+	return reason
+}
+
+func localRuleCount() int {
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM rules").Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// applyMu makes applying a pulled config one operation. Two pulls do overlap:
+// the one made at startup and the one the first heartbeat asks for. Interleaved,
+// the listeners could end up on one version's routes while the database and the
+// recorded version are the other's, and the version check below would be a
+// check-then-act race.
+var applyMu sync.Mutex
+
 func applyConfigFromPanel(configResp ConfigResponse) {
+	applyMu.Lock()
+	defer applyMu.Unlock()
+
+	if reason := rejectPulledConfig(configResp); reason != "" {
+		return
+	}
+
 	configMu.RLock()
 	oldSNIListen := globalConfig.SNIListen
 	oldLogLevel := globalConfig.LogLevel
@@ -1226,6 +1307,7 @@ func applyConfigFromPanel(configResp ConfigResponse) {
 	configVersionMu.Lock()
 	configVersionCounter = configResp.ConfigVersion
 	configVersionMu.Unlock()
+	clearConfigReject()
 
 	log.Infof("config applied successfully (version: %d, rules: %d, sni_listen: %s)", configResp.ConfigVersion, len(configResp.Rules), incoming.SNIListen)
 
@@ -1248,18 +1330,18 @@ func applyRules(rules []Rule, configVersion int) error {
 		return err
 	}
 
-	type portStart struct {
-		id       int
-		name     string
-		port     int
-		dest     []string
-		strategy string
-	}
-	var portStarts []portStart
-
-	for _, rule := range rules {
+	// Copied because the loop fills in normalised SNIs and assigned ids, and the
+	// caller's slice is the decoded panel response.
+	rules = append([]Rule(nil), rules...)
+	for i := range rules {
+		rule := &rules[i]
 		rule.SNI = normalizeSNI(rule.SNI)
 		destJSON, _ := json.Marshal(rule.Dest)
+		fallbackJSON := ""
+		if len(rule.Fallback) > 0 {
+			b, _ := json.Marshal(rule.Fallback)
+			fallbackJSON = string(b)
+		}
 		enabled := 0
 		if rule.Enabled {
 			enabled = 1
@@ -1277,30 +1359,23 @@ func applyRules(rules []Rule, configVersion int) error {
 			// A panel too old to send ids leaves attribution impossible either way;
 			// let SQLite assign one so the rule itself still works.
 			result, err := tx.Exec(`
-				INSERT INTO rules (name, type, sni, listen_port, dest, lb_strategy, enabled, version)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			`, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion)
+				INSERT INTO rules (name, type, sni, listen_port, dest, lb_strategy, enabled, version, fallback)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion, fallbackJSON)
 			if err != nil {
 				return err
 			}
 			id, _ := result.LastInsertId()
 			ruleID = int(id)
 		} else if _, err := tx.Exec(`
-			INSERT INTO rules (id, name, type, sni, listen_port, dest, lb_strategy, enabled, version)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, ruleID, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion); err != nil {
+			INSERT INTO rules (id, name, type, sni, listen_port, dest, lb_strategy, enabled, version, fallback)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, ruleID, rule.Name, rule.Type, rule.SNI, rule.ListenPort, string(destJSON), rule.LBStrategy, enabled, configVersion, fallbackJSON); err != nil {
 			return err
 		}
-
-		if rule.Type == RuleTypePort && rule.Enabled {
-			portStarts = append(portStarts, portStart{
-				id:       ruleID,
-				name:     rule.Name,
-				port:     rule.ListenPort,
-				dest:     rule.Dest,
-				strategy: rule.LBStrategy,
-			})
-		}
+		// The listeners are keyed to the id actually stored, which for a panel
+		// that sends none is the one SQLite just assigned.
+		rule.ID = ruleID
 	}
 
 	if _, err := tx.Exec("UPDATE panel_config SET value = ? WHERE key = 'config_version'", configVersion); err != nil {
@@ -1311,24 +1386,20 @@ func applyRules(rules []Rule, configVersion int) error {
 		return err
 	}
 
-	portListenersMu.Lock()
-	for port, pf := range portListeners {
-		log.Infof("stopping port forwarder on :%d for config update", port)
-		pf.cancel()
-		if pf.ln != nil {
-			_ = pf.ln.Close()
-		}
-	}
-	portListeners = make(map[int]*portForwarder)
-	portListenersMu.Unlock()
-
-	for _, ps := range portStarts {
-		ctx := context.Background()
-		go startPortForwarder(ctx, ps.id, ps.name, ps.port, ps.dest, ps.strategy)
-	}
+	// Applied as a difference, not a restart. This used to close every port
+	// listener and rebind all of them, which cut every port-forwarded connection
+	// on the node on every push, including ones whose rule had not changed.
+	// Listeners now stay up and have their routes swapped; the connections that
+	// are no longer where their rule sends traffic are closed below, and only
+	// those.
+	reconcilePortForwarders(mainCtx, rules)
 
 	if err := rebuildSniRouteCacheFromDB(); err != nil {
 		return err
+	}
+	setPinnedTargets(rules)
+	if n := dropStaleConnections(); n > 0 {
+		log.Infof("[Sync] closed %d connection(s) whose backend the new config moved away from", n)
 	}
 	return nil
 }
@@ -1799,7 +1870,7 @@ func fetchExpectedSHA256(binaryURL string) (string, error) {
 
 func getAllRules() ([]Rule, error) {
 	rows, err := db.Query(`
-		SELECT id, name, type, COALESCE(sni, ''), COALESCE(listen_port, 0), dest, lb_strategy, enabled
+		SELECT id, name, type, COALESCE(sni, ''), COALESCE(listen_port, 0), dest, lb_strategy, enabled, COALESCE(fallback, '')
 		FROM rules ORDER BY id ASC
 	`)
 	if err != nil {
@@ -1810,12 +1881,13 @@ func getAllRules() ([]Rule, error) {
 	var rules []Rule
 	for rows.Next() {
 		var rule Rule
-		var destJSON string
+		var destJSON, fallbackJSON string
 		var enabled int
-		if err := rows.Scan(&rule.ID, &rule.Name, &rule.Type, &rule.SNI, &rule.ListenPort, &destJSON, &rule.LBStrategy, &enabled); err != nil {
+		if err := rows.Scan(&rule.ID, &rule.Name, &rule.Type, &rule.SNI, &rule.ListenPort, &destJSON, &rule.LBStrategy, &enabled, &fallbackJSON); err != nil {
 			continue
 		}
 		json.Unmarshal([]byte(destJSON), &rule.Dest)
+		rule.Fallback = decodeDestList(fallbackJSON)
 		rule.Enabled = enabled == 1
 		rules = append(rules, rule)
 	}

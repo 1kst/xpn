@@ -31,12 +31,13 @@ var (
 )
 
 const (
-	handshakeTimeout = 8 * time.Second
-	idleTimeout      = 3 * time.Minute
-	transferTimeout  = 2 * time.Hour
-	dnsCacheTTL      = 60 * time.Second
-	dnsNegativeTTL   = 5 * time.Second
-	dnsLookupTimeout = 2 * time.Second
+	handshakeTimeout   = 8 * time.Second
+	backendDialTimeout = 6 * time.Second
+	idleTimeout        = 3 * time.Minute
+	transferTimeout    = 2 * time.Hour
+	dnsCacheTTL        = 60 * time.Second
+	dnsNegativeTTL     = 5 * time.Second
+	dnsLookupTimeout   = 2 * time.Second
 )
 
 // DefaultBinaryURL is the fallback download for this node's own architecture.
@@ -56,7 +57,7 @@ func DefaultBinaryURL() string {
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.18"
+	NodeVersion  = "v1.1.19"
 )
 
 func binaryURLForVersion(version string) string {
@@ -89,7 +90,13 @@ type Rule struct {
 	LBStrategy string   `json:"lb_strategy"`
 	Enabled    bool     `json:"enabled"`
 	Version    int      `json:"version"`
-	Counter    uint64   `json:"-"`
+	// Fallback is where the rule's traffic goes once every address in Dest has
+	// been found unreachable. The panel fills it in when the operator pinned this
+	// entry node to a landing of its own for the rule: Dest is then that landing
+	// and Fallback the rule's shared default. Empty means no failover, which is
+	// also what a panel too old to know about pinning sends.
+	Fallback []string `json:"fallback,omitempty"`
+	Counter  uint64   `json:"-"`
 }
 
 type Config struct {
@@ -101,13 +108,48 @@ type Config struct {
 	WebTitle       string `json:"web_title"`
 }
 
+// sniRouteEntry is where one rule sends new connections. Port forwarders hold one
+// too, swapped in place when the rule's targets change, so a listener no longer
+// has to be torn down (and its connections with it) just to point it elsewhere.
 type sniRouteEntry struct {
 	// ruleID attributes the traffic this route carries. Port rules already know
 	// their id from startPortForwarder; SNI rules had no way to report it.
 	ruleID   int
 	dests    []string
+	fallback []string
 	strategy string
 	counter  uint64
+}
+
+// pinned reports whether dests is a landing this entry node was pinned to, with
+// fallback to use while it is down.
+func (e *sniRouteEntry) pinned() bool {
+	return e != nil && len(e.fallback) > 0
+}
+
+// pick chooses the backend for a new connection, and whether it is the
+// fallback. Without a fallback this is the rule's load balancing exactly as it
+// always was.
+func (e *sniRouteEntry) pick() (string, bool) {
+	if !e.pinned() {
+		return selectBackend(e.dests, e.strategy, &e.counter), false
+	}
+	if len(e.dests) == 1 {
+		if !failoverIsDown(e.dests[0]) {
+			return e.dests[0], false
+		}
+	} else {
+		live := make([]string, 0, len(e.dests))
+		for _, d := range e.dests {
+			if !failoverIsDown(d) {
+				live = append(live, d)
+			}
+		}
+		if len(live) > 0 {
+			return selectBackend(live, e.strategy, &e.counter), false
+		}
+	}
+	return selectBackend(e.fallback, e.strategy, &e.counter), true
 }
 
 // ruleCounters is one rule's accounting. Updated from the relay loops, so every
@@ -218,6 +260,10 @@ func destEverReachable(dest string) bool {
 type portForwarder struct {
 	cancel context.CancelFunc
 	ln     net.Listener
+	name   string
+	// route is read once per accepted connection, so replacing it redirects new
+	// connections without closing the listener.
+	route atomic.Pointer[sniRouteEntry]
 }
 
 type dnsCacheEntry struct {
@@ -232,11 +278,15 @@ var (
 	configMu        sync.RWMutex
 	portListeners   = make(map[int]*portForwarder)
 	portListenersMu sync.Mutex
-	sniRouteCache   = make(map[string]*sniRouteEntry)
-	sniRouteMu      sync.RWMutex
-	sniRouteLogN    uint64
-	dnsCache        = make(map[string]*dnsCacheEntry)
-	dnsCacheMu      sync.Mutex
+	// desiredPorts is what the current configuration wants listening, which can
+	// differ from portListeners while a bind is failing and being retried. The
+	// retry loop stops as soon as its route is no longer the wanted one.
+	desiredPorts  = make(map[int]*sniRouteEntry)
+	sniRouteCache = make(map[string]*sniRouteEntry)
+	sniRouteMu    sync.RWMutex
+	sniRouteLogN  uint64
+	dnsCache      = make(map[string]*dnsCacheEntry)
+	dnsCacheMu    sync.Mutex
 
 	sniListenerCancel context.CancelFunc
 	sniListenerLn     net.Listener
@@ -399,6 +449,13 @@ func Run(forcedMode string) {
 			log.Errorf("start port forwarders: %v", err)
 		}
 
+		// From the local table, so a node that restarts while the panel is
+		// unreachable still fails over.
+		if rules, err := getAllRules(); err == nil {
+			setPinnedTargets(rules)
+		}
+		go failoverLoop(ctx)
+
 		go startNode(panelURL, token, nodeID, pullInterval)
 
 		wg.Add(1)
@@ -558,6 +615,7 @@ func initDB(dbPath string) (*sql.DB, error) {
 		lb_strategy TEXT DEFAULT 'round_robin',
 		enabled INTEGER DEFAULT 1,
 		version INTEGER DEFAULT 0,
+		fallback TEXT DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -603,6 +661,9 @@ func initDB(dbPath string) (*sql.DB, error) {
 	}
 
 	database.Exec("ALTER TABLE rules ADD COLUMN version INTEGER DEFAULT 0")
+	// Stored so failover survives a restart while the panel is unreachable: the
+	// node runs from this table until it can pull again.
+	database.Exec("ALTER TABLE rules ADD COLUMN fallback TEXT DEFAULT ''")
 	database.Exec("ALTER TABLE nodes ADD COLUMN status_data TEXT")
 	database.Exec("ALTER TABLE nodes ADD COLUMN ipv4 TEXT")
 	database.Exec("ALTER TABLE nodes ADD COLUMN ipv6 TEXT")
@@ -898,9 +959,18 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		}
 	}
 
-	backend, ruleID, matched := routeSNIBackend(sni)
+	entry, matched := lookupSNIRoute(sni)
 	if !matched {
 		noteSNIMiss(sni, err)
+	}
+	ruleID := 0
+	var backend string
+	viaFallback := false
+	if entry != nil {
+		ruleID = entry.ruleID
+		backend, viaFallback = entry.pick()
+	} else {
+		backend = getDefaultBackend()
 	}
 	counters := counterFor(ruleID)
 	if counters != nil {
@@ -930,7 +1000,7 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		}
 	}
 
-	backendConn, err := dialBackendWithDNSCache("tcp", backend, 6*time.Second)
+	backendConn, backend, viaFallback, err := dialPicked(entry, backend, viaFallback)
 	if err != nil {
 		// Only counted once this node has proved it can reach the destination at
 		// all, so a rule aimed at a loopback or node-local address does not make
@@ -949,6 +1019,19 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	}
 	noteDialResult(backend, true)
 	defer backendConn.Close()
+
+	// Registered so a config push or a failover can close this connection when
+	// the backend it is on is no longer where its traffic belongs.
+	untrack := trackConn(&trackedConn{
+		kind:        connKindSNI,
+		sni:         normalizeSNI(sni),
+		ruleID:      ruleID,
+		backend:     backend,
+		viaFallback: viaFallback,
+		client:      client,
+		upstream:    backendConn,
+	})
+	defer untrack()
 
 	// The absolute cap now lives in sessionActivity. Setting it on the conns
 	// here had no effect: proxyWithIdleTimeout resets the read/write deadlines
@@ -987,18 +1070,49 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	}
 }
 
-// routeSNIBackend also reports which rule matched, so the traffic can be
-// attributed, and whether anything matched at all. The match is returned
-// explicitly rather than inferred from a zero rule id: the caller classifies the
-// miss, and it should not have to know which sentinel means "none".
-func routeSNIBackend(sni string) (backend string, ruleID int, matched bool) {
+// lookupSNIRoute returns the route for a hostname and whether anything matched.
+// The match is returned explicitly rather than inferred from a nil entry: the
+// caller classifies the miss, and it should not have to know which sentinel
+// means "none". A miss goes to default_backend.
+func lookupSNIRoute(sni string) (*sniRouteEntry, bool) {
 	sniRouteMu.RLock()
 	entry := sniRouteCache[normalizeSNI(sni)]
 	sniRouteMu.RUnlock()
 	if entry != nil && len(entry.dests) > 0 {
-		return selectBackend(entry.dests, entry.strategy, &entry.counter), entry.ruleID, true
+		return entry, true
 	}
-	return getDefaultBackend(), 0, false
+	return nil, false
+}
+
+// dialPicked connects to the backend pick chose. When that is the landing this
+// entry was pinned to and it does not answer within failoverDialTimeout, the
+// connection goes to the rule's fallback instead: the first users to hit a
+// landing that has just died see a short delay rather than a failure. The failed
+// attempt prompts an immediate probe but does not itself count toward marking
+// the landing down, since that closes every connection on it and a burst of
+// user dials can fail for reasons that say nothing about the landing.
+func dialPicked(entry *sniRouteEntry, backend string, viaFallback bool) (net.Conn, string, bool, error) {
+	onPinned := entry.pinned() && !viaFallback
+	timeout := backendDialTimeout
+	if onPinned {
+		timeout = failoverDialTimeout
+	}
+	conn, err := dialBackendWithDNSCache("tcp", backend, timeout)
+	if !onPinned {
+		return conn, backend, viaFallback, err
+	}
+	if err == nil {
+		failoverObserve(backend, nil)
+		return conn, backend, false, nil
+	}
+	noteDialResult(backend, false)
+	failoverSuspect(backend)
+	fallback := selectBackend(entry.fallback, entry.strategy, &entry.counter)
+	if n, ok := throttledLog("pinfail:" + backend); ok {
+		log.WithFields(throttledFields(logrus.Fields{"landing": backend, "fallback": fallback, "err": err}, n)).Warn("pinned landing unreachable, using fallback")
+	}
+	conn, err = dialBackendWithDNSCache("tcp", fallback, backendDialTimeout)
+	return conn, fallback, true, err
 }
 
 // noteSNIMiss books a connection that reached no rule against the reason it did
@@ -1031,7 +1145,7 @@ func normalizeHost(s string) string {
 
 func rebuildSniRouteCacheFromDB() error {
 	rows, err := db.Query(`
-		SELECT id, COALESCE(sni, ''), dest, lb_strategy
+		SELECT id, COALESCE(sni, ''), dest, lb_strategy, COALESCE(fallback, '')
 		FROM rules
 		WHERE type = ? AND enabled = 1
 	`, RuleTypeSNI)
@@ -1043,8 +1157,8 @@ func rebuildSniRouteCacheFromDB() error {
 	next := make(map[string]*sniRouteEntry)
 	for rows.Next() {
 		var ruleID int
-		var sni, destJSON, lbStrategy string
-		if err := rows.Scan(&ruleID, &sni, &destJSON, &lbStrategy); err != nil {
+		var sni, destJSON, lbStrategy, fallbackJSON string
+		if err := rows.Scan(&ruleID, &sni, &destJSON, &lbStrategy, &fallbackJSON); err != nil {
 			return err
 		}
 		var dests []string
@@ -1058,6 +1172,7 @@ func rebuildSniRouteCacheFromDB() error {
 		next[normSNI] = &sniRouteEntry{
 			ruleID:   ruleID,
 			dests:    dests,
+			fallback: decodeDestList(fallbackJSON),
 			strategy: lbStrategy,
 		}
 	}
@@ -1191,65 +1306,182 @@ func getDefaultBackend() string {
 }
 
 func startAllPortForwarders(ctx context.Context) error {
-	rows, err := db.Query("SELECT id, name, listen_port, dest, lb_strategy FROM rules WHERE type = ? AND enabled = 1", RuleTypePort)
+	rules, err := getAllRules()
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var id, port int
-		var name, destJSON, lbStrategy string
-		if err := rows.Scan(&id, &name, &port, &destJSON, &lbStrategy); err != nil {
-			continue
-		}
-
-		var dests []string
-		json.Unmarshal([]byte(destJSON), &dests)
-
-		if err := startPortForwarder(ctx, id, name, port, dests, lbStrategy); err != nil {
-			log.Errorf("start port forwarder %s:%d failed: %v", name, port, err)
-		}
-	}
-
+	reconcilePortForwarders(ctx, rules)
 	return nil
 }
 
-func startPortForwarder(ctx context.Context, ruleID int, name string, port int, dests []string, lbStrategy string) error {
-	portListenersMu.Lock()
-	defer portListenersMu.Unlock()
+// portSpec is one enabled port rule as the listeners need it.
+type portSpec struct {
+	port  int
+	name  string
+	route *sniRouteEntry
+}
 
-	if pf, exists := portListeners[port]; exists {
+func portSpecsFromRules(rules []Rule) map[int]portSpec {
+	want := make(map[int]portSpec)
+	for _, rule := range rules {
+		if rule.Type != RuleTypePort || !rule.Enabled {
+			continue
+		}
+		if rule.ListenPort < 1 || rule.ListenPort > 65535 {
+			log.Warnf("port rule %q has unusable listen port %d, skipped", rule.Name, rule.ListenPort)
+			continue
+		}
+		want[rule.ListenPort] = portSpec{
+			port: rule.ListenPort,
+			name: rule.Name,
+			route: &sniRouteEntry{
+				ruleID:   rule.ID,
+				dests:    rule.Dest,
+				fallback: rule.Fallback,
+				strategy: rule.LBStrategy,
+			},
+		}
+	}
+	return want
+}
+
+// reconcilePortForwarders brings the listeners in line with rules. A port that
+// stays configured keeps its listener and has only its route swapped, so its
+// connections survive; which of them still belong where they are is decided
+// afterwards by dropStaleConnections. Only a port that is no longer wanted is
+// closed, and only a new one is bound.
+func reconcilePortForwarders(ctx context.Context, rules []Rule) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	want := portSpecsFromRules(rules)
+
+	var toStart []portSpec
+	portListenersMu.Lock()
+	for port, pf := range portListeners {
+		if _, ok := want[port]; ok {
+			continue
+		}
+		log.Infof("stopping port forwarder on :%d, no longer configured", port)
 		pf.cancel()
 		if pf.ln != nil {
 			_ = pf.ln.Close()
 		}
 		delete(portListeners, port)
-		time.Sleep(100 * time.Millisecond)
+	}
+	desiredPorts = make(map[int]*sniRouteEntry, len(want))
+	for port, spec := range want {
+		desiredPorts[port] = spec.route
+		if pf, ok := portListeners[port]; ok {
+			pf.route.Store(spec.route)
+			pf.name = spec.name
+			continue
+		}
+		toStart = append(toStart, spec)
+	}
+	portListenersMu.Unlock()
+
+	for _, spec := range toStart {
+		go ensurePortListener(ctx, spec)
+	}
+}
+
+// ensurePortListener binds a port and keeps retrying while the bind fails, which
+// it can when another process holds the port or the previous socket has not
+// been released yet. It used to be a single attempt whose error was discarded,
+// so the rule stopped working with nothing in the log to say so. The failure is
+// also reported to the panel on each heartbeat until the bind succeeds.
+func ensurePortListener(ctx context.Context, spec portSpec) {
+	delay := 2 * time.Second
+	for {
+		err := upsertPortForwarder(ctx, spec.port, spec.name, spec.route, true)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, errPortNotWanted) {
+			// A newer configuration took the port over or dropped it; whichever it
+			// was, it is now responsible for the port and for its failure record.
+			return
+		}
+		if n, ok := throttledLog(fmt.Sprintf("listen:%d", spec.port)); ok {
+			log.WithFields(throttledFields(logrus.Fields{"port": spec.port, "rule": spec.name, "err": err, "retry_in": delay}, n)).Error("port forwarder cannot listen")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+		}
+	}
+}
+
+var errPortNotWanted = errors.New("port is no longer wanted by the configuration")
+
+// startPortForwarder serves one port rule. Kept for the local web panel, which
+// manages rules one at a time; config pushed from the panel goes through
+// reconcilePortForwarders instead.
+func startPortForwarder(ctx context.Context, ruleID int, name string, port int, dests []string, lbStrategy string) error {
+	route := &sniRouteEntry{ruleID: ruleID, dests: dests, strategy: lbStrategy}
+	portListenersMu.Lock()
+	desiredPorts[port] = route
+	portListenersMu.Unlock()
+	return upsertPortForwarder(ctx, port, name, route, false)
+}
+
+// upsertPortForwarder points port at route, binding a listener only if there is
+// none yet. An existing listener is never closed here: replacing its route is
+// enough to redirect new connections, and closing it used to cut every
+// connection it carried.
+//
+// onlyIfWanted makes the check against desiredPorts part of the same critical
+// section as the bind, so a retry that raced a newer configuration cannot
+// install the route that configuration just replaced.
+func upsertPortForwarder(ctx context.Context, port int, name string, route *sniRouteEntry, onlyIfWanted bool) error {
+	portListenersMu.Lock()
+	defer portListenersMu.Unlock()
+
+	if onlyIfWanted && desiredPorts[port] != route {
+		return errPortNotWanted
 	}
 
+	if pf, exists := portListeners[port]; exists {
+		pf.route.Store(route)
+		pf.name = name
+		clearListenFailure(port)
+		return nil
+	}
+
+	// The failure record is written and cleared here, under the same lock as the
+	// bind, so a retry that failed cannot record its failure after a newer
+	// attempt has bound the port and cleared it.
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		recordListenFailure(port, route.ruleID, err)
 		return err
 	}
+	clearListenFailure(port)
 
 	portCtx, cancel := context.WithCancel(ctx)
-	portListeners[port] = &portForwarder{
+	pf := &portForwarder{
 		cancel: cancel,
 		ln:     ln,
+		name:   name,
 	}
+	pf.route.Store(route)
+	portListeners[port] = pf
 
 	log.WithFields(logrus.Fields{
 		"name": name,
 		"port": port,
-		"dest": dests,
-		"lb":   lbStrategy,
+		"dest": route.dests,
+		"lb":   route.strategy,
 	}).Info("port forwarder started")
 
 	go func() {
 		defer ln.Close()
-		var counter uint64
 		var wg sync.WaitGroup
 		acceptDelay := time.Duration(0)
 
@@ -1288,7 +1520,7 @@ func startPortForwarder(ctx context.Context, ruleID int, name string, port int, 
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handlePortForward(c, ruleID, dests, lbStrategy, &counter, portCtx)
+				handlePortForward(c, port, pf.route.Load(), portCtx)
 			}(conn)
 		}
 	}()
@@ -1308,20 +1540,29 @@ func stopAllPortForwarders() {
 		}
 	}
 	portListeners = make(map[int]*portForwarder)
+	desiredPorts = make(map[int]*sniRouteEntry)
 }
 
-func handlePortForward(client net.Conn, ruleID int, dests []string, lbStrategy string, counter *uint64, ctx context.Context) {
+// handlePortForward relays one connection accepted on port. route is the
+// listener's route at the moment the connection was accepted; a later config
+// push that moves the rule elsewhere closes this connection through
+// dropStaleConnections rather than by tearing the listener down.
+func handlePortForward(client net.Conn, port int, route *sniRouteEntry, ctx context.Context) {
 	defer client.Close()
 	clientAddr := client.RemoteAddr().String()
+	if route == nil {
+		return
+	}
+	ruleID := route.ruleID
 
 	counters := counterFor(ruleID)
 	if counters != nil {
 		counters.conns.Add(1)
 	}
 
-	backend := selectBackend(dests, lbStrategy, counter)
+	backend, viaFallback := route.pick()
 
-	backendConn, err := dialBackendWithDNSCache("tcp", backend, 6*time.Second)
+	backendConn, backend, viaFallback, err := dialPicked(route, backend, viaFallback)
 	if err != nil {
 		if counters != nil && destEverReachable(backend) {
 			counters.dialFail.Add(1)
@@ -1334,6 +1575,17 @@ func handlePortForward(client net.Conn, ruleID int, dests []string, lbStrategy s
 	}
 	noteDialResult(backend, true)
 	defer backendConn.Close()
+
+	untrack := trackConn(&trackedConn{
+		kind:        connKindPort,
+		port:        port,
+		ruleID:      ruleID,
+		backend:     backend,
+		viaFallback: viaFallback,
+		client:      client,
+		upstream:    backendConn,
+	})
+	defer untrack()
 
 	_ = client.SetDeadline(time.Time{})
 	_ = backendConn.SetDeadline(time.Time{})

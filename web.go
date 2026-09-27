@@ -510,6 +510,7 @@ func stopPortForwarder(port int) {
 		}
 		delete(portListeners, port)
 	}
+	delete(desiredPorts, port)
 	portListenersMu.Unlock()
 }
 
@@ -572,6 +573,7 @@ func addRuleHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	dropStaleConnections()
 
 	log.Infof("rule added: %s (%s)", rule.Name, rule.Type)
 
@@ -660,12 +662,16 @@ func updateRuleHandler(w http.ResponseWriter, r *http.Request) {
 			if err := startPortForwarder(ctx, id, rule.Name, rule.ListenPort, rule.Dest, rule.LBStrategy); err != nil {
 				log.Errorf("start port forwarder for rule %d (:%d) failed: %v", id, rule.ListenPort, err)
 			}
+			// The listener keeps its connections when only its targets change, so
+			// the ones on a target this edit removed are closed here.
+			dropStaleConnections()
 		}()
 	}
 	if err := rebuildSniRouteCacheFromDB(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	dropStaleConnections()
 
 	log.Infof("rule updated: %s (ID=%d)", rule.Name, id)
 
@@ -700,6 +706,7 @@ func deleteRuleHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			delete(portListeners, port)
 		}
+		delete(desiredPorts, port)
 		portListenersMu.Unlock()
 	}
 
@@ -710,6 +717,7 @@ func deleteRuleHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	dropStaleConnections()
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -816,6 +824,7 @@ func handleImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	dropStaleConnections()
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{

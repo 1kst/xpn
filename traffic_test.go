@@ -289,10 +289,10 @@ func TestTotalSNIMissesIsTheSum(t *testing.T) {
 	}
 }
 
-// TestRouteSNIBackendReportsMatch covers the signature change: the caller decides
-// what a miss means, so routeSNIBackend has to say whether anything matched
-// rather than leaving it to be inferred from a zero rule id.
-func TestRouteSNIBackendReportsMatch(t *testing.T) {
+// TestLookupSNIRouteReportsMatch covers the signature: the caller decides what a
+// miss means, so lookupSNIRoute has to say whether anything matched rather than
+// leaving it to be inferred from a nil entry.
+func TestLookupSNIRouteReportsMatch(t *testing.T) {
 	resetTrafficState()
 
 	sniRouteMu.Lock()
@@ -310,23 +310,27 @@ func TestRouteSNIBackendReportsMatch(t *testing.T) {
 		sniRouteMu.Unlock()
 	})
 
-	if backend, id, matched := routeSNIBackend("a.example.com"); !matched || id != 7 || backend != "10.0.0.1:443" {
-		t.Errorf("hit = (%q, %d, %v), want (10.0.0.1:443, 7, true)", backend, id, matched)
+	entry, matched := lookupSNIRoute("a.example.com")
+	if !matched || entry == nil || entry.ruleID != 7 {
+		t.Fatalf("hit = (%v, %v), want rule 7 matched", entry, matched)
+	}
+	if backend, viaFallback := entry.pick(); backend != "10.0.0.1:443" || viaFallback {
+		t.Errorf("pick = (%q, %v), want (10.0.0.1:443, false)", backend, viaFallback)
 	}
 	// Case and a trailing dot are normalised, so the same rule has to match.
-	if _, id, matched := routeSNIBackend("A.Example.COM."); !matched || id != 7 {
-		t.Errorf("normalised hit = (%d, %v), want (7, true)", id, matched)
+	if e, matched := lookupSNIRoute("A.Example.COM."); !matched || e.ruleID != 7 {
+		t.Errorf("normalised hit = (%v, %v), want rule 7 matched", e, matched)
 	}
-	if _, id, matched := routeSNIBackend("other.example.com"); matched || id != 0 {
-		t.Errorf("miss = (%d, %v), want (0, false)", id, matched)
+	if e, matched := lookupSNIRoute("other.example.com"); matched || e != nil {
+		t.Errorf("miss = (%v, %v), want (nil, false)", e, matched)
 	}
-	if _, _, matched := routeSNIBackend("empty.example.com"); matched {
+	if _, matched := lookupSNIRoute("empty.example.com"); matched {
 		t.Error("a rule with no destinations must not report a match")
 	}
 
-	// routeSNIBackend must no longer count anything itself: double counting here
-	// and at the call site would inflate every miss by two.
+	// The lookup must not count anything itself: double counting here and at the
+	// call site would inflate every miss by two.
 	if totalSNIMisses() != 0 {
-		t.Errorf("routeSNIBackend counted %d misses; counting belongs to noteSNIMiss", totalSNIMisses())
+		t.Errorf("lookupSNIRoute counted %d misses; counting belongs to noteSNIMiss", totalSNIMisses())
 	}
 }
