@@ -99,6 +99,9 @@ type HeartbeatRequest struct {
 	UpdateMessage string         `json:"update_message,omitempty"`
 	UpdateAt      string         `json:"update_at,omitempty"`
 	Traffic       *NodeCounters  `json:"traffic,omitempty"`
+	// ActiveConns is how many connections are being relayed right now. Sent even
+	// when zero, so the panel can tell zero from a node too old to report it.
+	ActiveConns int `json:"active_conns"`
 	// Failover carries the pinned landings that are down right now and the
 	// transitions the panel has not acknowledged yet.
 	Failover     *FailoverReport `json:"failover,omitempty"`
@@ -1093,6 +1096,7 @@ func sendHeartbeat() {
 		StatusData:    statusData,
 		System:        collectSystemMetrics(),
 		Traffic:       collectTrafficCounters(),
+		ActiveConns:   activeConnCount(),
 		Failover:      failoverReport(),
 		ListenErrors:  listenErrors(),
 		ConfigReject:  currentConfigReject(),

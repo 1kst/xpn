@@ -3,6 +3,7 @@ package xpfw
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -751,4 +752,37 @@ func TestUserDialFailuresDoNotMarkDown(t *testing.T) {
 	failoverMu.Lock()
 	delete(probing, landing)
 	failoverMu.Unlock()
+}
+
+// TestActiveConnCountIsReported: the heartbeat carries how many connections are
+// being relayed, zero included, so the panel can tell zero from a node too old
+// to report it.
+func TestActiveConnCountIsReported(t *testing.T) {
+	withTestDB(t)
+	resetForwarding(t)
+
+	b, _ := json.Marshal(HeartbeatRequest{})
+	if !strings.Contains(string(b), `"active_conns":0`) {
+		t.Errorf("a heartbeat with no connections omits the count: %s", b)
+	}
+
+	a := bannerBackend(t, "A")
+	port := freePort(t)
+	if err := applyRules([]Rule{portRule(1, port, a)}, 1); err != nil {
+		t.Fatalf("applyRules: %v", err)
+	}
+	c1, _ := dialPort(t, port)
+	c2, _ := dialPort(t, port)
+	if n := activeConnCount(); n != 2 {
+		t.Errorf("active = %d with two relayed connections, want 2", n)
+	}
+	c1.Close()
+	c2.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for activeConnCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := activeConnCount(); n != 0 {
+		t.Errorf("active = %d after both closed, want 0", n)
+	}
 }

@@ -61,6 +61,14 @@ func trackConn(c *trackedConn) func() {
 	}
 }
 
+// activeConnCount is the number of connections being relayed right now. One
+// still in its handshake or dialling its backend is not counted yet.
+func activeConnCount() int {
+	activeConnsMu.Lock()
+	defer activeConnsMu.Unlock()
+	return len(activeConns)
+}
+
 func snapshotConns() []*trackedConn {
 	activeConnsMu.Lock()
 	defer activeConnsMu.Unlock()
