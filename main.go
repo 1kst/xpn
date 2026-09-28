@@ -60,7 +60,7 @@ func DefaultBinaryURL() string {
 
 var (
 	PanelVersion = "v1.0"
-	NodeVersion  = "v1.1.19"
+	NodeVersion  = "v1.1.20"
 )
 
 func binaryURLForVersion(version string) string {
@@ -1029,7 +1029,9 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		// Dialling the backend for it used to cost a backend connection and up to
 		// the idle timeout of relaying nothing, per probe.
 		noteSNIMiss(sni, err)
-		recordProbe(ProbeEvent{TS: nowRFC3339(), SrcIP: ipOnly(clientAddr), DstPort: localPort(client), Kind: probeNoTLS})
+		src := ipOnly(clientAddr)
+		hr, rb := realTrafficFor(srcGroup(src))
+		recordProbe(ProbeEvent{TS: nowRFC3339(), SrcIP: src, DstPort: localPort(client), Kind: probeNoTLS, SrcHasReal: hr, SrcRealBytes: rb})
 		return
 	}
 	if err != nil {
@@ -1082,6 +1084,7 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		}
 		defer func() {
 			probe.DurMS = time.Since(started).Milliseconds()
+			probe.SrcHasReal, probe.SrcRealBytes = realTrafficFor(srcGroup(probe.SrcIP))
 			recordProbe(*probe)
 		}()
 	}
@@ -1190,6 +1193,10 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		probe.Up += u
 		probe.Down += d
 		probe.Responded = d > 0
+	} else if u+d >= realTrafficMinBytes {
+		// A real, rule-matched session that moved real data: this source is a
+		// genuine user, which lets the panel exonerate any probe it also emits.
+		noteRealTraffic(srcGroup(ipOnly(clientAddr)), u+d)
 	}
 }
 
@@ -1851,13 +1858,19 @@ func handlePortForward(client net.Conn, port int, route *sniRouteEntry, ctx cont
 	// as a possible scan. Recorded for visibility only, never scored: a port
 	// listener cannot tell a scanner from a client that had nothing to say.
 	if u == 0 && d == 0 {
+		src := ipOnly(clientAddr)
+		hr, rb := realTrafficFor(srcGroup(src))
 		recordProbe(ProbeEvent{
-			TS:      nowRFC3339(),
-			SrcIP:   ipOnly(clientAddr),
-			DstPort: port,
-			Kind:    probePort,
-			DurMS:   time.Since(started).Milliseconds(),
+			TS:           nowRFC3339(),
+			SrcIP:        src,
+			DstPort:      port,
+			Kind:         probePort,
+			DurMS:        time.Since(started).Milliseconds(),
+			SrcHasReal:   hr,
+			SrcRealBytes: rb,
 		})
+	} else if u+d >= realTrafficMinBytes {
+		noteRealTraffic(srcGroup(ipOnly(clientAddr)), u+d)
 	}
 }
 

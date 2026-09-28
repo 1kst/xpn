@@ -50,6 +50,15 @@ type ProbeEvent struct {
 	Up        uint64 `json:"up"`
 	Down      uint64 `json:"down"`
 	Responded bool   `json:"resp,omitempty"`
+	// SrcHasReal is set when this source group has also completed a real,
+	// rule-matched session carrying real bytes recently. A genuine user transfers
+	// data; a pure prober does not, so this lets the panel exonerate a source that
+	// merely reconnects badly from one that only ever probes. Node-computed.
+	SrcHasReal bool `json:"real,omitempty"`
+	// SrcRealBytes is the source group's real transferred bytes still remembered
+	// in the node's rolling window, shown for context (a productivity signal is a
+	// ratio, not this absolute number).
+	SrcRealBytes uint64 `json:"realb,omitempty"`
 }
 
 const probeBufferMax = 512
@@ -106,6 +115,84 @@ func ipOnly(remoteAddr string) string {
 		return host
 	}
 	return remoteAddr
+}
+
+// srcGroup canonicalises a source IP into the key the panel aggregates by: an
+// IPv4 address as-is, an IPv6 address masked to its /64. Kept identical to the
+// panel's grouping so a real session and a probe from the same client (or the
+// same /64) collapse to one key.
+func srcGroup(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	if parsed.To4() != nil {
+		return ip
+	}
+	return parsed.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// Source-level real-traffic memory. A source that completes a real, rule-matched
+// session carrying at least realTrafficMinBytes is remembered for realTrafficTTL,
+// so the panel can tell a genuine user (which transfers data) from a pure prober
+// (which does not). Bounded: a busy node sees many clients and this must not grow
+// without bound. Only the group key and a timestamp are kept, never any content.
+const (
+	realTrafficMinBytes = 4096
+	realTrafficMax      = 20000
+	realTrafficTTL      = 24 * time.Hour
+)
+
+type realEntry struct {
+	ts    time.Time
+	bytes uint64
+}
+
+var (
+	realMu   sync.Mutex
+	realSeen = map[string]*realEntry{}
+)
+
+// noteRealTraffic records n real bytes for group, evicting expired then the
+// oldest entry when full.
+func noteRealTraffic(group string, n uint64) {
+	now := time.Now()
+	realMu.Lock()
+	if e := realSeen[group]; e != nil {
+		e.ts = now
+		e.bytes += n
+	} else {
+		realSeen[group] = &realEntry{ts: now, bytes: n}
+	}
+	if len(realSeen) > realTrafficMax {
+		var oldestK string
+		var oldestT time.Time
+		for k, e := range realSeen {
+			if now.Sub(e.ts) > realTrafficTTL {
+				delete(realSeen, k)
+				continue
+			}
+			if oldestT.IsZero() || e.ts.Before(oldestT) {
+				oldestK, oldestT = k, e.ts
+			}
+		}
+		if len(realSeen) > realTrafficMax && oldestK != "" {
+			delete(realSeen, oldestK)
+		}
+	}
+	realMu.Unlock()
+}
+
+// realTrafficFor reports whether group completed a real session within the TTL
+// and how many real bytes are still remembered for it.
+func realTrafficFor(group string) (bool, uint64) {
+	realMu.Lock()
+	e := realSeen[group]
+	realMu.Unlock()
+	if e == nil || time.Since(e.ts) > realTrafficTTL {
+		return false, 0
+	}
+	return true, e.bytes
 }
 
 func localPort(c net.Conn) int {
