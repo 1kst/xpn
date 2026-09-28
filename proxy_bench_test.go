@@ -50,8 +50,8 @@ func fakeClientHello(serverName string) []byte {
 	ext = append(ext, 0x00, 0x00, byte(len(list)>>8), byte(len(list)))
 	ext = append(ext, list...)
 
-	body := make([]byte, 34)   // version + random
-	body = append(body, 0x00)  // session_id length
+	body := make([]byte, 34)              // version + random
+	body = append(body, 0x00)             // session_id length
 	body = append(body, 0, 2, 0x13, 0x01) // cipher_suites
 	body = append(body, 0x01, 0x00)       // compression
 	body = append(body, byte(len(ext)>>8), byte(len(ext)))
@@ -334,7 +334,7 @@ func relayBench(b *testing.B, chunk int, useProxy bool) {
 		if useProxy {
 			done := make(chan struct{}, 1)
 			var ctr atomic.Uint64
-			proxyWithIdleTimeout(be, cl, done, idleTimeout, newSessionActivity(transferTimeout), "c->b", &ctr)
+			proxyWithIdleTimeout(be, cl, done, idleTimeout, newSessionActivity(transferTimeout), "c->b", &byteSink{conn: &ctr})
 		} else {
 			buf := make([]byte, 32*1024)
 			io.CopyBuffer(be, cl, buf)

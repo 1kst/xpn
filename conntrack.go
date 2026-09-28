@@ -124,7 +124,7 @@ func connStillRouted(c *trackedConn) bool {
 		if c.kind == connKindSNI {
 			// Unmatched traffic belongs to default_backend and nowhere else. A
 			// connection that matched a rule which has since gone falls here too.
-			return c.ruleID == 0 && c.backend == getDefaultBackend()
+			return c.ruleID == 0 && c.backend == getMissBackend()
 		}
 		return false
 	}

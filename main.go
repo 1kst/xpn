@@ -105,10 +105,16 @@ type Rule struct {
 type Config struct {
 	SNIListen      string `json:"sni_listen"`
 	DefaultBackend string `json:"default_backend"`
-	WebPanel       string `json:"web_panel"`
-	WebAuth        string `json:"web_auth"`
-	LogLevel       string `json:"log_level"`
-	WebTitle       string `json:"web_title"`
+	// FallbackBackend is where unmatched, non-TLS and no-SNI connections on the
+	// SNI listener go: a real, innocuous site, so a prober crafting such a
+	// connection sees an ordinary server rather than the behaviour of whatever
+	// default_backend fronts. Empty falls back to default_backend, which is the
+	// old behaviour and what a panel too old to send this leaves.
+	FallbackBackend string `json:"fallback_backend"`
+	WebPanel        string `json:"web_panel"`
+	WebAuth         string `json:"web_auth"`
+	LogLevel        string `json:"log_level"`
+	WebTitle        string `json:"web_title"`
 }
 
 // sniRouteEntry is where one rule sends new connections. Port forwarders hold one
@@ -686,12 +692,13 @@ func initDB(dbPath string) (*sql.DB, error) {
 	database.Exec("ALTER TABLE nodes ADD COLUMN last_update_at DATETIME")
 
 	defaultConfig := map[string]string{
-		"sni_listen":      ":443",
-		"default_backend": "127.0.0.1:8080",
-		"web_panel":       ":8888",
-		"web_auth":        "",
-		"log_level":       "info",
-		"web_title":       "SNI Proxy Pro",
+		"sni_listen":       ":443",
+		"default_backend":  "127.0.0.1:8080",
+		"fallback_backend": "",
+		"web_panel":        ":8888",
+		"web_auth":         "",
+		"log_level":        "info",
+		"web_title":        "SNI Proxy Pro",
 	}
 
 	for k, v := range defaultConfig {
@@ -732,12 +739,13 @@ func loadConfig() error {
 
 	configMu.Lock()
 	globalConfig = Config{
-		SNIListen:      configMap["sni_listen"],
-		DefaultBackend: configMap["default_backend"],
-		WebPanel:       configMap["web_panel"],
-		WebAuth:        configMap["web_auth"],
-		LogLevel:       configMap["log_level"],
-		WebTitle:       configMap["web_title"],
+		SNIListen:       configMap["sni_listen"],
+		DefaultBackend:  configMap["default_backend"],
+		FallbackBackend: configMap["fallback_backend"],
+		WebPanel:        configMap["web_panel"],
+		WebAuth:         configMap["web_auth"],
+		LogLevel:        configMap["log_level"],
+		WebTitle:        configMap["web_title"],
 	}
 	configMu.Unlock()
 
@@ -755,12 +763,13 @@ func saveConfig(cfg Config) error {
 	defer tx.Rollback()
 
 	updates := map[string]string{
-		"sni_listen":      cfg.SNIListen,
-		"default_backend": cfg.DefaultBackend,
-		"web_panel":       cfg.WebPanel,
-		"web_auth":        cfg.WebAuth,
-		"log_level":       cfg.LogLevel,
-		"web_title":       cfg.WebTitle,
+		"sni_listen":       cfg.SNIListen,
+		"default_backend":  cfg.DefaultBackend,
+		"fallback_backend": cfg.FallbackBackend,
+		"web_panel":        cfg.WebPanel,
+		"web_auth":         cfg.WebAuth,
+		"log_level":        cfg.LogLevel,
+		"web_title":        cfg.WebTitle,
 	}
 
 	for k, v := range updates {
@@ -977,6 +986,11 @@ func serveSNIListener(ctx context.Context, addr string, ln net.Listener) {
 		}
 		acceptDelay = 0
 
+		if blockedAddr(conn.RemoteAddr().String()) {
+			conn.Close()
+			continue
+		}
+
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
@@ -1012,9 +1026,10 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	sni, peeked, err := peekClientHelloSNI(br)
 	if err != nil && len(peeked) == 0 && br.Buffered() == 0 {
 		// Nothing arrived at all: a port probe, a bare connect, a health check.
-		// Dialling default_backend for it used to cost a backend connection and up
-		// to the idle timeout of relaying nothing, per probe.
+		// Dialling the backend for it used to cost a backend connection and up to
+		// the idle timeout of relaying nothing, per probe.
 		noteSNIMiss(sni, err)
+		recordProbe(ProbeEvent{TS: nowRFC3339(), SrcIP: ipOnly(clientAddr), DstPort: localPort(client), Kind: probeNoTLS})
 		return
 	}
 	if err != nil {
@@ -1029,9 +1044,6 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	}
 
 	entry, matched := lookupSNIRoute(sni)
-	if !matched {
-		noteSNIMiss(sni, err)
-	}
 	ruleID := 0
 	var backend string
 	viaFallback := false
@@ -1039,7 +1051,33 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 		ruleID = entry.ruleID
 		backend, viaFallback = entry.pick()
 	} else {
-		backend = getDefaultBackend()
+		backend = getMissBackend()
+	}
+
+	// A miss is recorded as a probe: metadata only, its byte and duration fields
+	// filled in as the connection runs and booked when it returns, by whichever
+	// path. The bytes it did read are hashed, never kept.
+	var probe *ProbeEvent
+	if !matched {
+		noteSNIMiss(sni, err)
+		started := time.Now()
+		probe = &ProbeEvent{
+			TS:       nowRFC3339(),
+			SrcIP:    ipOnly(clientAddr),
+			DstPort:  localPort(client),
+			Kind:     missKind(sni, err),
+			SNI:      sni,
+			IsTLS:    err == nil,
+			FirstLen: len(peeked),
+			FP:       fingerprintFirstBytes(peeked),
+		}
+		if err == nil {
+			probe.CHLen = len(peeked)
+		}
+		defer func() {
+			probe.DurMS = time.Since(started).Milliseconds()
+			recordProbe(*probe)
+		}()
 	}
 	counters := counterFor(ruleID)
 	if counters != nil {
@@ -1110,9 +1148,9 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 
 	// c->b is what the client uploads, b->c what it downloads. Kept apart because
 	// egress is usually the side that gets billed.
-	var up, down *atomic.Uint64
+	var ruleUp, ruleDown *atomic.Uint64
 	if counters != nil {
-		up, down = &counters.bytesUp, &counters.bytesDown
+		ruleUp, ruleDown = &counters.bytesUp, &counters.bytesDown
 	}
 
 	// The handshake and anything that arrived with it go first. They are client
@@ -1128,23 +1166,38 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 	if len(first) > 0 {
 		_ = backendConn.SetWriteDeadline(time.Now().Add(idleTimeout))
 		n, werr := backendConn.Write(first)
-		bytesTo(up, n)
+		if n > 0 {
+			if ruleUp != nil {
+				ruleUp.Add(uint64(n))
+			}
+			if probe != nil {
+				probe.Up += uint64(n)
+			}
+		}
 		if werr != nil {
 			return
 		}
 	}
 
-	relayPair(client, backendConn, up, down, ctx)
+	u, d := relayPair(client, backendConn, ruleUp, ruleDown, ctx)
+	if probe != nil {
+		probe.Up += u
+		probe.Down += d
+		probe.Responded = d > 0
+	}
 }
 
 // relayPair relays both directions of one connection until both are done, or
 // ctx ends. When one direction finishes first, the other is put on the shorter
 // halfCloseIdle limit and woken so it applies it at once.
-func relayPair(client, backendConn net.Conn, up, down *atomic.Uint64, ctx context.Context) {
+func relayPair(client, backendConn net.Conn, ruleUp, ruleDown *atomic.Uint64, ctx context.Context) (up, down uint64) {
+	var connUp, connDown atomic.Uint64
+	upSink := &byteSink{conn: &connUp, rule: ruleUp}
+	downSink := &byteSink{conn: &connDown, rule: ruleDown}
 	activity := newSessionActivity(transferTimeout)
 	done := make(chan struct{}, 2)
-	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b", up)
-	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c", down)
+	go proxyWithIdleTimeout(backendConn, client, done, idleTimeout, activity, "c->b", upSink)
+	go proxyWithIdleTimeout(client, backendConn, done, idleTimeout, activity, "b->c", downSink)
 
 	select {
 	case <-done:
@@ -1165,6 +1218,7 @@ func relayPair(client, backendConn net.Conn, up, down *atomic.Uint64, ctx contex
 		<-done
 		<-done
 	}
+	return connUp.Load(), connDown.Load()
 }
 
 // routeSampleAt is when the last routing sample was logged. Sampling by time
@@ -1271,6 +1325,18 @@ func noteSNIMiss(sni string, peekErr error) {
 		missNoSNI.Add(1)
 	default:
 		missNoRule.Add(1)
+	}
+}
+
+// missKind names a miss the way noteSNIMiss counts it, for the probe record.
+func missKind(sni string, peekErr error) string {
+	switch {
+	case peekErr != nil:
+		return probeNoTLS
+	case sni == "":
+		return probeNoSNI
+	default:
+		return probeNoRule
 	}
 }
 
@@ -1460,6 +1526,17 @@ func dialBackendWithDNSCache(network, target string, timeout time.Duration) (net
 func getDefaultBackend() string {
 	configMu.RLock()
 	defer configMu.RUnlock()
+	return globalConfig.DefaultBackend
+}
+
+// getMissBackend is where an SNI-listener connection goes when it matched no
+// rule: the camouflage site if one is set, otherwise default_backend.
+func getMissBackend() string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	if fb := strings.TrimSpace(globalConfig.FallbackBackend); fb != "" {
+		return fb
+	}
 	return globalConfig.DefaultBackend
 }
 
@@ -1675,6 +1752,11 @@ func upsertPortForwarder(ctx context.Context, port int, name string, route *sniR
 			}
 			acceptDelay = 0
 
+			if blockedAddr(conn.RemoteAddr().String()) {
+				conn.Close()
+				continue
+			}
+
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
@@ -1757,7 +1839,20 @@ func handlePortForward(client net.Conn, port int, route *sniRouteEntry, ctx cont
 	if counters != nil {
 		up, down = &counters.bytesUp, &counters.bytesDown
 	}
-	relayPair(client, backendConn, up, down, ctx)
+	started := time.Now()
+	u, d := relayPair(client, backendConn, up, down, ctx)
+	// A port-rule connection that moved no application bytes is worth surfacing
+	// as a possible scan. Recorded for visibility only, never scored: a port
+	// listener cannot tell a scanner from a client that had nothing to say.
+	if u == 0 && d == 0 {
+		recordProbe(ProbeEvent{
+			TS:      nowRFC3339(),
+			SrcIP:   ipOnly(clientAddr),
+			DstPort: port,
+			Kind:    probePort,
+			DurMS:   time.Since(started).Milliseconds(),
+		})
+	}
 }
 
 func selectBackend(dests []string, strategy string, counter *uint64) string {
@@ -1882,16 +1977,28 @@ func (s *sessionActivity) idleLimit(timeout time.Duration) time.Duration {
 // a second, and the clock is read twice per chunk; resetting both deadlines and
 // reading the clock five times per chunk used to cost more than the copy on
 // virtual machines with a slow clock source.
-// bytesTo accumulates relayed payload into a counter when one is supplied. A nil
-// counter means the connection could not be attributed to a rule (an SNI miss
-// routed to default_backend), and the bytes are simply not attributed.
-func bytesTo(c *atomic.Uint64, n int) {
-	if c != nil && n > 0 {
-		c.Add(uint64(n))
+// byteSink fans one direction's relayed bytes out to a per-connection total and,
+// when the connection belongs to a rule, that rule's shared counter. The
+// per-connection total is what lets a miss be recorded with how much it moved
+// without disturbing the live per-rule accounting.
+type byteSink struct {
+	conn *atomic.Uint64
+	rule *atomic.Uint64
+}
+
+func (s *byteSink) add(n int) {
+	if s == nil || n <= 0 {
+		return
+	}
+	if s.conn != nil {
+		s.conn.Add(uint64(n))
+	}
+	if s.rule != nil {
+		s.rule.Add(uint64(n))
 	}
 }
 
-func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.Duration, activity *sessionActivity, direction string, relayed *atomic.Uint64) {
+func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.Duration, activity *sessionActivity, direction string, relayed *byteSink) {
 	defer func() {
 		if tc, ok := dst.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -1937,7 +2044,7 @@ func proxyWithIdleTimeout(dst, src net.Conn, done chan<- struct{}, timeout time.
 			_, werr := dst.Write(buf[:n])
 			// Counted on the read: the bytes did cross this node even if the far
 			// side went away before they could be handed on.
-			bytesTo(relayed, n)
+			relayed.add(n)
 			if werr != nil {
 				return
 			}

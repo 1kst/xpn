@@ -105,6 +105,10 @@ type HeartbeatRequest struct {
 	// ActiveConns is how many connections are being relayed right now. Sent even
 	// when zero, so the panel can tell zero from a node too old to report it.
 	ActiveConns int `json:"active_conns"`
+	// Probes are the anomalous connections seen since the last heartbeat, and
+	// ProbeDropped how many were shed because the buffer was full.
+	Probes       []ProbeEvent `json:"probes,omitempty"`
+	ProbeDropped uint64       `json:"probe_dropped,omitempty"`
 	// Failover carries the pinned landings that are down right now and the
 	// transitions the panel has not acknowledged yet.
 	Failover     *FailoverReport `json:"failover,omitempty"`
@@ -429,6 +433,10 @@ type HeartbeatResponse struct {
 	BinaryURL        string `json:"binary_url"`
 	// FailoverAck is the highest failover event seq the panel has processed.
 	FailoverAck uint64 `json:"failover_ack,omitempty"`
+	// Blacklist is the full set of banned sources (IPs and CIDRs); the node
+	// replaces its copy when BlacklistVersion changes.
+	Blacklist        []string `json:"blacklist,omitempty"`
+	BlacklistVersion int      `json:"blacklist_version,omitempty"`
 }
 
 type ConfigResponse struct {
@@ -1176,6 +1184,7 @@ func sendHeartbeat() {
 		ListenErrors:  listenErrors(),
 		ConfigReject:  currentConfigReject(),
 	}
+	req.Probes, req.ProbeDropped = drainProbes()
 	reportedStatus, message, at := getNodeUpdateState()
 	if reportedStatus != "" {
 		req.UpdateStatus = reportedStatus
@@ -1224,6 +1233,7 @@ func sendHeartbeat() {
 	// this any earlier loses the outcome whenever the POST itself fails.
 	clearNodeUpdateState(reportedStatus)
 	ackFailoverEvents(heartbeatResp.FailoverAck)
+	setBlocklist(heartbeatResp.BlacklistVersion, heartbeatResp.Blacklist)
 
 	if heartbeatResp.NeedUpdate {
 		log.Infof("[Heartbeat] remote version %d is newer than local %d, pulling update...", heartbeatResp.ConfigVersion, currentVersion)
