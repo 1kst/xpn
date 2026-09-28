@@ -43,7 +43,9 @@ type ProbeEvent struct {
 	IsTLS     bool   `json:"tls,omitempty"`
 	FirstLen  int    `json:"flen,omitempty"` // bytes read before routing
 	CHLen     int    `json:"chlen,omitempty"`
-	FP        string `json:"fp,omitempty"` // sha256 prefix of the first bytes
+	FP        string `json:"fp,omitempty"`  // sha256 prefix of the first bytes
+	JA3       string `json:"ja3,omitempty"` // md5 of the ClientHello's JA3 string
+	UA        string `json:"ua,omitempty"`  // User-Agent, plain-HTTP probes only
 	DurMS     int64  `json:"dur"`
 	Up        uint64 `json:"up"`
 	Down      uint64 `json:"down"`

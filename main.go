@@ -1072,7 +1072,13 @@ func handleSNIConn(client net.Conn, ctx context.Context) {
 			FP:       fingerprintFirstBytes(peeked),
 		}
 		if err == nil {
+			// A real ClientHello: its JA3 groups this probe with others made by
+			// the same client library even if each re-randomises its bytes.
 			probe.CHLen = len(peeked)
+			probe.JA3 = parseJA3Hash(peeked)
+		} else {
+			// Not TLS: if it was a plain-HTTP request it may name a scanner.
+			probe.UA = extractUA(peeked)
 		}
 		defer func() {
 			probe.DurMS = time.Since(started).Milliseconds()
