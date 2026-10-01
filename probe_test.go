@@ -156,3 +156,61 @@ func TestIPOnly(t *testing.T) {
 }
 
 var _ = net.ParseIP
+
+func resetReal() {
+	realMu.Lock()
+	realSeen = map[string]*realEntry{}
+	realPending = map[string]struct{}{}
+	realMu.Unlock()
+}
+
+// TestRealSourcesReportedOncePerWindow: a group is queued the first time it
+// transfers real data, drained once, not re-queued within realReportEvery, and
+// put back when the heartbeat carrying it fails.
+func TestRealSourcesReportedOncePerWindow(t *testing.T) {
+	resetReal()
+	noteRealTraffic("1.2.3.4", 5000)
+	got := drainRealSources()
+	if len(got) != 1 || got[0].G != "1.2.3.4" || got[0].B != 5000 {
+		t.Fatalf("first drain = %+v, want one entry 1.2.3.4/5000", got)
+	}
+	noteRealTraffic("1.2.3.4", 7000)
+	if again := drainRealSources(); len(again) != 0 {
+		t.Fatalf("re-reported within the window: %+v", again)
+	}
+	requeueRealSources(got)
+	back := drainRealSources()
+	if len(back) != 1 || back[0].B != 12000 {
+		t.Fatalf("requeued drain = %+v, want 1.2.3.4 with accumulated 12000 bytes", back)
+	}
+}
+
+// TestRealSourcesDrainIsCapped: a burst larger than realReportMax goes out over
+// several heartbeats, nothing lost.
+func TestRealSourcesDrainIsCapped(t *testing.T) {
+	resetReal()
+	total := realReportMax + 37
+	for i := 0; i < total; i++ {
+		noteRealTraffic(fmt.Sprintf("10.%d.%d.%d", i>>16&255, i>>8&255, i&255), 4096)
+	}
+	first := drainRealSources()
+	second := drainRealSources()
+	if len(first) != realReportMax || len(first)+len(second) != total {
+		t.Fatalf("drained %d then %d, want %d then %d", len(first), len(second), realReportMax, total-realReportMax)
+	}
+}
+
+// TestSrcGroupNormalisesMappedV4: the node keys sources exactly like the panel.
+func TestSrcGroupNormalisesMappedV4(t *testing.T) {
+	cases := map[string]string{
+		"1.2.3.4":                  "1.2.3.4",
+		"::ffff:1.2.3.4":           "1.2.3.4",
+		"2409:8a5c:3a32:b670::1":   "2409:8a5c:3a32:b670::/64",
+		"2409:8a5c:3a32:b670:a::9": "2409:8a5c:3a32:b670::/64",
+	}
+	for in, want := range cases {
+		if got := srcGroup(in); got != want {
+			t.Errorf("srcGroup(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

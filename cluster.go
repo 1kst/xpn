@@ -109,6 +109,10 @@ type HeartbeatRequest struct {
 	// ProbeDropped how many were shed because the buffer was full.
 	Probes       []ProbeEvent `json:"probes,omitempty"`
 	ProbeDropped uint64       `json:"probe_dropped,omitempty"`
+	// RealSources are source groups that transferred real data here, each sent
+	// at most once an hour, so the panel can exonerate them fleet-wide. A panel
+	// too old to read it ignores it.
+	RealSources []RealSource `json:"real_sources,omitempty"`
 	// Failover carries the pinned landings that are down right now and the
 	// transitions the panel has not acknowledged yet.
 	Failover     *FailoverReport `json:"failover,omitempty"`
@@ -1185,6 +1189,15 @@ func sendHeartbeat() {
 		ConfigReject:  currentConfigReject(),
 	}
 	req.Probes, req.ProbeDropped = drainProbes()
+	req.RealSources = drainRealSources()
+	// Real-source reports are put back if this heartbeat never reaches the panel;
+	// probes stay fire-and-forget as before.
+	delivered := false
+	defer func() {
+		if !delivered && len(req.RealSources) > 0 {
+			requeueRealSources(req.RealSources)
+		}
+	}()
 	reportedStatus, message, at := getNodeUpdateState()
 	if reportedStatus != "" {
 		req.UpdateStatus = reportedStatus
@@ -1220,6 +1233,7 @@ func sendHeartbeat() {
 		}
 		return
 	}
+	delivered = true
 
 	var heartbeatResp HeartbeatResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHeartbeatResponse)).Decode(&heartbeatResp); err != nil {

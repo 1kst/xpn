@@ -126,58 +126,126 @@ func srcGroup(ip string) string {
 	if parsed == nil {
 		return ip
 	}
-	if parsed.To4() != nil {
-		return ip
+	if v4 := parsed.To4(); v4 != nil {
+		// Normalised like the panel's probeSrcGroup, so an IPv4-mapped address
+		// (::ffff:a.b.c.d) and the plain one are the same source.
+		return v4.String()
 	}
 	return parsed.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // Source-level real-traffic memory. A source that completes a real, rule-matched
 // session carrying at least realTrafficMinBytes is remembered for realTrafficTTL,
-// so the panel can tell a genuine user (which transfers data) from a pure prober
-// (which does not). Bounded: a busy node sees many clients and this must not grow
-// without bound. Only the group key and a timestamp are kept, never any content.
+// so a probe from a source that is also a genuine user can be told apart from a
+// pure prober. Bounded: a busy node sees many clients and this must not grow
+// without bound. Only the group key, a timestamp and a byte count are kept.
+//
+// The same memory feeds the panel fleet-wide: a group is queued for the next
+// heartbeat when it first transfers real data and then at most once per
+// realReportEvery, so the panel can exonerate a source that misbehaves on one
+// node while it is a real user of another. A steady user costs one entry an hour.
 const (
 	realTrafficMinBytes = 4096
 	realTrafficMax      = 20000
 	realTrafficTTL      = 24 * time.Hour
+	realReportEvery     = time.Hour
+	realReportMax       = 5000
 )
 
+// RealSource is one source group this node has seen transfer real data, as sent
+// on the heartbeat. Field names are short because a busy node sends many.
+type RealSource struct {
+	G string `json:"g"` // source group: IPv4 address, or IPv6 /64
+	B uint64 `json:"b"` // real bytes remembered for it
+}
+
 type realEntry struct {
-	ts    time.Time
-	bytes uint64
+	ts         time.Time
+	bytes      uint64
+	reportedAt time.Time
 }
 
 var (
-	realMu   sync.Mutex
-	realSeen = map[string]*realEntry{}
+	realMu      sync.Mutex
+	realSeen    = map[string]*realEntry{}
+	realPending = map[string]struct{}{}
 )
 
-// noteRealTraffic records n real bytes for group, evicting expired then the
+// noteRealTraffic records n real bytes for group, queues it for the panel if it
+// has not been reported within realReportEvery, and evicts expired then the
 // oldest entry when full.
 func noteRealTraffic(group string, n uint64) {
 	now := time.Now()
 	realMu.Lock()
-	if e := realSeen[group]; e != nil {
+	e := realSeen[group]
+	if e != nil {
 		e.ts = now
 		e.bytes += n
 	} else {
-		realSeen[group] = &realEntry{ts: now, bytes: n}
+		e = &realEntry{ts: now, bytes: n}
+		realSeen[group] = e
+	}
+	if e.reportedAt.IsZero() || now.Sub(e.reportedAt) >= realReportEvery {
+		realPending[group] = struct{}{}
 	}
 	if len(realSeen) > realTrafficMax {
 		var oldestK string
 		var oldestT time.Time
-		for k, e := range realSeen {
-			if now.Sub(e.ts) > realTrafficTTL {
+		for k, x := range realSeen {
+			if now.Sub(x.ts) > realTrafficTTL {
 				delete(realSeen, k)
+				delete(realPending, k)
 				continue
 			}
-			if oldestT.IsZero() || e.ts.Before(oldestT) {
-				oldestK, oldestT = k, e.ts
+			if oldestT.IsZero() || x.ts.Before(oldestT) {
+				oldestK, oldestT = k, x.ts
 			}
 		}
 		if len(realSeen) > realTrafficMax && oldestK != "" {
 			delete(realSeen, oldestK)
+			delete(realPending, oldestK)
+		}
+	}
+	realMu.Unlock()
+}
+
+// drainRealSources hands the queued groups to a heartbeat, at most realReportMax
+// of them; the rest stay queued for the next one.
+func drainRealSources() []RealSource {
+	now := time.Now()
+	realMu.Lock()
+	defer realMu.Unlock()
+	if len(realPending) == 0 {
+		return nil
+	}
+	n := len(realPending)
+	if n > realReportMax {
+		n = realReportMax
+	}
+	out := make([]RealSource, 0, n)
+	for g := range realPending {
+		if len(out) >= realReportMax {
+			break
+		}
+		delete(realPending, g)
+		e := realSeen[g]
+		if e == nil {
+			continue
+		}
+		e.reportedAt = now
+		out = append(out, RealSource{G: g, B: e.bytes})
+	}
+	return out
+}
+
+// requeueRealSources puts back groups whose heartbeat never reached the panel,
+// so they go out on the next one instead of waiting out realReportEvery.
+func requeueRealSources(list []RealSource) {
+	realMu.Lock()
+	for _, r := range list {
+		if e := realSeen[r.G]; e != nil {
+			e.reportedAt = time.Time{}
+			realPending[r.G] = struct{}{}
 		}
 	}
 	realMu.Unlock()
