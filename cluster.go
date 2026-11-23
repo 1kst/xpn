@@ -73,6 +73,8 @@ type NodeInfo struct {
 
 type SystemMetrics struct {
 	CPU            float64 `json:"cpu"`
+	CPUModel       string  `json:"cpu_model,omitempty"`
+	CPUCores       int     `json:"cpu_cores,omitempty"`
 	MemUsed        uint64  `json:"mem_used"`
 	MemTotal       uint64  `json:"mem_total"`
 	DiskUsed       uint64  `json:"disk_used"`
@@ -1017,8 +1019,20 @@ func pruneProbeCache(active map[string]struct{}) {
 	}
 }
 
+var hardwareInfoOnce sync.Once
+var hardwareCPUModel string
+var hardwareCPUCores int
+
 func collectSystemMetrics() *SystemMetrics {
-	m := &SystemMetrics{}
+	hardwareInfoOnce.Do(func() {
+		if info, err := cpu.Info(); err == nil && len(info) > 0 {
+			hardwareCPUModel = strings.TrimSpace(info[0].ModelName)
+		}
+		if cores, err := cpu.Counts(true); err == nil && cores > 0 {
+			hardwareCPUCores = cores
+		}
+	})
+	m := &SystemMetrics{CPUModel: hardwareCPUModel, CPUCores: hardwareCPUCores}
 
 	if cp, err := cpu.Percent(0, false); err == nil && len(cp) > 0 {
 		m.CPU = cp[0]
